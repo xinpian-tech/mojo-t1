@@ -15,7 +15,7 @@
  * t1rt.c — T1 simulation engine for the T1 RVV accelerator
  * driven through the t1rocketemu batch simulator.
  *
- * Execution model (milestone 1, see T1/docs/minimal-kernel-plan.md):
+ * Execution model:
  * the simulator loads one ELF at reset and runs it to completion, so the
  * runtime keeps a host-side shadow of the device window and, on synchronize,
  * composes trampoline + kernel + argblock + buffer contents into a single

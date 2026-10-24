@@ -91,7 +91,7 @@ Before the threading changes, the single-thread stories15M baseline produced
 token 9038 (`Once`) for the empty prompt. The threaded TinyLlama and the
 thread-exchange test compile through Nix; the exchange test passes 64
 barriers with one, two, three and four active harts on RTL.
-Historical documents in `docs/` must not be treated as validated HAL examples.
+See [docs/README.md](docs/README.md) for the current documentation index.
 
 The `thread-tilelang` T1 checkout provides a four-hart configuration with
 1024-bit per-thread VLEN. The extension now implements independent launch

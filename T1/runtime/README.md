@@ -59,6 +59,5 @@ does not disable PERF markers, result readback or correctness comparisons.
 every writable buffer's size. `T1RT_PC_HISTOGRAM` enables the patched
 pokedex instruction histogram consumed by `../tools/analyze-rvv-mix.py`.
 
-See `../README.md` for the separate Mojo and T1 packages. The documents in
-`../docs/` describing AsyncRT interposition are historical design records,
-not instructions for the HAL implementation.
+See [../README.md](../README.md) for the separate Mojo and T1 packages and
+[../docs/README.md](../docs/README.md) for the current documentation index.
