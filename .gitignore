@@ -1,4 +1,5 @@
 /result*
+/build/
 __pycache__/
 *.pyc
 /T1/runtime/out/

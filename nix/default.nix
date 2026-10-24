@@ -78,7 +78,9 @@ let
   };
   t1CompilerFiles = lib.fileset.toSource {
     root = /. + builtins.unsafeDiscardStringContext self.outPath;
-    fileset = /. + builtins.unsafeDiscardStringContext self.outPath + "/T1/compiler";
+    fileset = lib.fileset.unions (map
+      (path: /. + builtins.unsafeDiscardStringContext self.outPath + path)
+      [ "/meson.build" "/meson.options" "/T1/compiler" ]);
   };
   t1Compiler = callPackage ./t1-compiler.nix {
     mojo-dev = mojo.dev;

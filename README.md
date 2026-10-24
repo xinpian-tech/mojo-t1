@@ -19,6 +19,7 @@ runtime setup, single-layer measurements and RTL regression tools.
 
 ## Layout
 
+- `meson.build`, `meson.options`: local compiler plugin and runtime build.
 - `flake.nix`, `flake.lock`: pinned upstream and Nix dependencies.
 - `nix/`: upstream toolchain packaging, development SDK and T1 packages.
 - `T1/`: compiler plugin, HAL driver, Mojo hooks, examples and tests.
@@ -27,6 +28,28 @@ runtime setup, single-layer measurements and RTL regression tools.
 headers and libraries. The T1 compiler package compiles only its own two
 C++ files against this development package. T1-only changes do not rebuild
 the upstream compiler.
+
+## Local build system
+
+Meson builds the T1 compiler plugin, HAL driver, smoke-test executable and
+RV32 trampoline/test artifacts. Nix invokes the same Meson targets with
+the pinned toolchains; upstream Mojo continues to use its upstream Bazel
+build, without changes to the SDK derivation.
+
+For a local Meson build, provide Clang 23 with libstdc++ for the host C++
+compiler, a C23 compiler, Meson, Ninja, Python 3, and LLVM's RISC-V tools:
+
+```sh
+meson setup build -Dmojo_dev=/path/to/mojo-dev --prefix=/path/to/install
+meson compile -C build
+meson test -C build --print-errorlogs
+meson install -C build
+```
+
+Set `CXX=clang++` at setup when Clang is not your default C++ compiler.
+Use `-Dcompiler=false` or `-Druntime=false` to build one package. The
+`rv_clang`, `rv_lld` and `rv_objcopy` options select the RV32 tools; Nix
+pins these to LLVM 22. HAL tests check symbols without an RTL simulator.
 
 The initial toolchain build is expensive. Supported validation currently
 targets `x86_64-linux`; the `aarch64-linux` dependency-cache hash still needs

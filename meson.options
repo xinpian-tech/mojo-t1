@@ -1,0 +1,6 @@
+option('mojo_dev', type: 'string', value: '', description: 'Matching Mojo development package')
+option('compiler', type: 'boolean', value: true, description: 'Build the T1 compiler plugin')
+option('runtime', type: 'boolean', value: true, description: 'Build the HAL driver and RV32 launch artifacts')
+option('rv_clang', type: 'string', value: 'clang', description: 'RISC-V capable Clang')
+option('rv_lld', type: 'string', value: 'ld.lld', description: 'RISC-V ELF linker')
+option('rv_objcopy', type: 'string', value: 'llvm-objcopy', description: 'RISC-V object copy tool')

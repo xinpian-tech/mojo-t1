@@ -24,8 +24,9 @@ result-t1-runtime/bin/t1-hal-smoke \
 
 This test drives the official HAL C ABI, including invalid memory ranges,
 offset copies, bundle/function lifetime, launch validation, events, buffer
-readback and SAXPY results. The Nix build also checks every required HAL
-symbol and rejects an exported legacy AsyncRT entry point.
+readback and SAXPY results. The Meson `hal-abi` test, also run by the Nix
+build, checks every required HAL symbol and rejects an exported legacy
+AsyncRT entry point.
 
 For RTL simulation, set `T1RT_EMULATOR` to the T1 Verilated simulator and
 unset `T1RT_EMULATOR_KIND`. Fast memory readback requires the simulator

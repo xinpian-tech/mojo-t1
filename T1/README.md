@@ -243,15 +243,9 @@ Lane Stage0/load-return arbiter. The latter must reselect live requests:
 load returns can move between slots under backpressure, so retaining only
 the selected producer while OR-ing both producers' valid signals can admit
 invalid load payloads with a newer instruction's destination and tag.
-The directed tests in `tests/rtl/srt_mode.sv` and
-`tests/rtl/scalar_contention.sv` reproduce failures in the baseline generated
-RTL and pass with the corresponding generated-RTL substitutions, built by
-`nix/t1-srt-regression.nix` and `nix/t1-scalar-regression.nix`.
-The scalar test injects a MulDiv response to exercise simultaneous returns;
-it is not an instruction-stream or full-system acceptance test.
-Both directed tests also pass against RTL regenerated from the patched
-Scala sources (`applyCandidate = false; expectFixed = true`). The Lane
-arbiter substitution alone fixes the four-hart LMUL8 RMSNorm stall; numerical
+Standalone generated-RTL unit tests are no longer included in this
+software repository. The Lane arbiter fix resolves the four-hart LMUL8
+RMSNorm stall; numerical
 checks pass with one through four harts. `verify-threaded.py` includes this
 2048-element regression before inference. With all three fixes regenerated
 and built together, RTL passes the 1–4 hart exchange/RMSNorm tests and both

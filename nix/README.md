@@ -123,9 +123,11 @@ headers, HAL headers and matching link libraries using Bazel's configured
 `CcInfo`. `nix/mojo-dev/` supplies the export target in a private build
 workspace; no upstream source files are modified for this interface.
 
-The T1 compiler derivation consumes this output and compiles only
+The T1 compiler derivation invokes the root Meson project, consumes this output and compiles only
 `T1Backend.cpp` and `T1Traits.cpp`, without running Bazel or rebuilding
 LLVM/MLIR/Mojo. The HAL driver also consumes the exported HAL headers.
+The runtime derivation uses the same Meson project with the compiler target
+disabled and runs its `hal-abi` test. Neither T1 derivation invokes Bazel.
 The development output requires a one-time SDK rebuild. Subsequent T1-only
 edits do not change the SDK derivation. The development interface remains
 revision-specific and must be used with the matching Mojo package.
