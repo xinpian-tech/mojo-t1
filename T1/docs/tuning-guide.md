@@ -315,10 +315,35 @@ not yet a measured Llama-layer gain. It justifies testing the changed
 packing in the actual prefill software rather than declaring the LSU limit
 unavoidable.
 
-Final six-mode package: `/nix/store/z3bg24qgljnx1fd0s303a4arnwqasr8i-mojo-t1-0.1.0`
+Six-mode checkpoint package: `/nix/store/z3bg24qgljnx1fd0s303a4arnwqasr8i-mojo-t1-0.1.0`
 (`nix build .#t1 -o /tmp/mojo-t1-throughput-segmented`). Validated runs are
 `/tmp/vme-final-mMODE-hHARTS-nITERATIONS-{model,rtl}` for modes 0–4 and
 `/tmp/vme-segmented-hHARTS-nITERATIONS-{model,rtl}` for mode 5.
+
+### Segment-load tail policy
+
+Mode 6 repeats the segmented experiment with `tu` instead of `ta`. Only
+active elements are subsequently consumed by VME, so retaining the unused
+tail is legal. LMUL=2 with four fields otherwise gives this implementation
+large agnostic tails to fill. For the same 1/2/4-hart experiments:
+
+| Segment-load policy | 1 hart | 2 harts | 4 harts |
+| --- | ---: | ---: | ---: |
+| Mode 5, `ta` | 104.0 | 52.0 | 41.75 |
+| Mode 6, `tu` | 76.0 | 38.0 | 27.25 |
+
+The four-hart iteration cost decreases 34.7%. The 256-iteration four-hart
+trace's `VrfPhysicalWrite` event count decreases from 523,520 to 50,240.
+These are event counts, not bus bytes. All 18 cases (two policies, three hart
+counts, three iteration counts) pass exact host checks and complete ISA/RTL
+dump comparison. The tail policy is a software choice, not a correctness fix
+to RTL's legal agnostic-tail behavior.
+
+Package: `/nix/store/x8if363i67n89vjfsm76cvg2l70f5zzm-mojo-t1-0.1.0`
+(`nix build .#t1 -o /tmp/mojo-t1-segmented-tail`). Runs:
+`/tmp/vme-tail-mMODE-hHARTS-nITERATIONS-{model,rtl}`. The production prefill
+segmented loads now use `tu`; the matrix operation restores its own matrix
+configuration before consuming the active elements.
 
 ### Physical instruction-slot occupancy
 
@@ -435,7 +460,7 @@ simulator fixes retained, the original failing single-token ELF also passes:
 105,315 total cycles, with its complete 157,088-byte memory dump identical
 to the ISA reference. No software workaround is required for that failure.
 
-The final software package also passes `t1-prefill --tokens 1`, `2`, `3`
+The original batched-prefill package also passes `t1-prefill --tokens 1`, `2`, `3`
 and `4` on that repaired simulator. Each invocation compares sequential and
 batched residuals and the full KV cache; its final complete 157,088-byte
 readback matches the corresponding ISA run. The integer GEMM and all three

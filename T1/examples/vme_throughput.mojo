@@ -31,6 +31,30 @@ def reload[activation_base: Int, weight_base: Int, compute: Bool = True](
     ](weights, inputs)
 
 
+def _segmented_asm[tail_agnostic: Bool]() -> String:
+    var policy = String("ta" if tail_agnostic else "tu")
+    return (
+        "li t0, 4\nvsetvli zero, t0, e8, m2, " + policy + ", ma\n"
+        "vlseg4e8.v v0, ($1)\n"
+        "li t0, 32\nvsetvli zero, t0, e8, m2, " + policy + ", ma\n"
+        "vlseg4e8.v v8, ($0)\n"
+        "li t0, 4227\nli t1, 256\n.word 0x8462f057\n"
+        "li t0, 32\n.word 0x8802f057\n.word 0xf2040477\n"
+    )
+
+
+@always_inline
+def segmented_reload[tail_agnostic: Bool](
+    weights: Pointer[Int8, MutAnyOrigin], inputs: Pointer[UInt8, MutAnyOrigin],
+):
+    comptime assembly = StaticString(materialize[_segmented_asm[tail_agnostic]()]())
+    inlined_assembly[
+        assembly, NoneType,
+        constraints="r,r,~{t0},~{t1},~{v0},~{v1},~{v2},~{v3},~{v4},~{v5},~{v6},~{v7},"
+        "~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{v14},~{v15},~{memory}",
+    ](weights.unsafe_offset(128), inputs.unsafe_offset(16))
+
+
 def throughput(
     output: Pointer[Int32, MutAnyOrigin], weights: Pointer[Int8, MutAnyOrigin],
     inputs: Pointer[UInt8, MutAnyOrigin], iterations: Int32, mode: Int32,
@@ -57,36 +81,23 @@ def throughput(
     elif mode == 4:
         for iteration in range(1, Int(iterations)):
             reload[8, 16, False](weights, inputs)
+    elif mode == 5:
+        for iteration in range(1, Int(iterations)):
+            segmented_reload[True](weights, inputs)
     else:
         for iteration in range(1, Int(iterations)):
-            inlined_assembly[
-                "li t0, 4\n"
-                "vsetvli zero, t0, e8, m2, ta, ma\n"
-                "vlseg4e8.v v0, ($1)\n"
-                "li t0, 32\n"
-                "vsetvli zero, t0, e8, m2, ta, ma\n"
-                "vlseg4e8.v v8, ($0)\n"
-                "li t0, 4227\n"
-                "li t1, 256\n"
-                ".word 0x8462f057\n"
-                "li t0, 32\n"
-                ".word 0x8802f057\n"
-                ".word 0xf2040477\n",
-                NoneType,
-                constraints="r,r,~{t0},~{t1},~{v0},~{v1},~{v2},~{v3},~{v4},~{v5},~{v6},~{v7},"
-                "~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{v14},~{v15},~{memory}",
-            ](weights.unsafe_offset(128), inputs.unsafe_offset(16))
+            segmented_reload[False](weights, inputs)
     matrix_finish(output.unsafe_offset(thread_idx.x * 128), 4, 32, 32)
 
 
 def main() raises:
     var arguments = argv()
     if len(arguments) != 4:
-        raise Error("usage: t1-vme-throughput MODE(0=resident,1=reload,2=pingpong,3=config,4=loads,5=segmented) HARTS(1..4) ITERATIONS(1..4096)")
+        raise Error("usage: t1-vme-throughput MODE(0=resident,1=reload,2=pingpong,3=config,4=loads,5=segmented,6=segmented-tu) HARTS(1..4) ITERATIONS(1..4096)")
     var mode = Int(arguments[1])
     var harts = Int(arguments[2])
     var iterations = Int(arguments[3])
-    if mode < 0 or mode > 5 or harts < 1 or harts > 4 or iterations < 1 or iterations > 4096:
+    if mode < 0 or mode > 6 or harts < 1 or harts > 4 or iterations < 1 or iterations > 4096:
         raise Error("invalid throughput configuration")
     var context = DeviceContext(api="t1")
     var output = context.enqueue_create_buffer[DType.int32](4 * 128)
