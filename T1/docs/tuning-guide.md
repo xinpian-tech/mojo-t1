@@ -108,6 +108,98 @@ same-hart execution overlap.
 
 ## Interpreting measurements
 
+### Why the current VME prefill remains slower than RVV
+
+A complete, streamed trace of the same measured Stories15M first-layer ELFs
+reproduces the original 1,901,030 VME and 1,309,351 RVV kernel cycles. Both
+traced memory dumps still match their respective ISA references. No kernel
+instrumentation, additional layers, or software arithmetic changes are used.
+
+The strongest software bottleneck is redundant scalar activation quantization.
+Each hart owns different output columns, but independently scans and quantizes
+all four input token rows into a private stack buffer. Across the seven
+projections, the input reduction dimensions sum to 2,496; quantizing once
+per projection requires 9,984 token activation elements. The trace instead executes 39,936
+element divisions plus 1,248 scale divisions: the same input work is repeated
+on all four harts. Each element also incurs scalar loads, abs/max, sign and
+clamp branches, integer conversion and byte packing. RVV has no activation
+quantization pass.
+
+The next structural cost is the group-32 epilogue. Each group has independent
+activation/weight scales, so the current kernel finishes and stores four
+INT32 tile rows, reloads them, corrects the unsigned zero point, converts to
+FP32, applies scales and reads/updates the FP32 output. Across four harts,
+there are 4,608 tile-row stores and 4,608 vector epilogue iterations. The
+existing FP32 RVV kernel instead keeps its output accumulator in vector
+registers across the full reduction. Simply merging differently scaled
+integer groups would change the computation and is not a valid shortcut.
+
+| Dynamic instruction metric, all four harts | VME GEMM | Pure RVV |
+| --- | ---: | ---: |
+| Retired instructions | 1,553,808 | 212,156 |
+| Scalar instructions, excluding vector/matrix config | 1,367,952 | 119,188 |
+| Vector/matrix configuration instructions | 35,444 | 1,416 |
+| Vector loads, including non-projection work | 95,194 | 42,152 |
+| Scalar FP divisions, including non-projection work | 41,276 | 92 |
+
+VME issues 9,216 `vtmmu` operations. Each K=4 step has four short activation
+loads and four weight loads, giving 73,728 operand-load instructions before
+epilogue and attention traffic. Four activation elements occupy only four
+bytes per load. Threaded LSU-to-VME forwarding is disabled, so operands pass
+through the vector register file. The weight-byte savings therefore do not
+imply fewer load instructions or less dispatch/VRF overhead. These are
+instruction counts, not measured AXI bandwidth or evidence that external
+memory bandwidth is saturated.
+
+As a localization aid, assign each interval between successive scalar-core
+retirements to the preceding instruction's PC region. Hart 0's 1,901,303-cycle
+observed timeline (including trampoline overhead) breaks down as follows:
+
+| PC region | Retirement-interval cycles | Share |
+| --- | ---: | ---: |
+| Scalar activation quantization | 816,516 | 42.9% |
+| Operand loads and matrix submission | 273,553 | 14.4% |
+| Tile stores and fence | 34,939 | 1.8% |
+| FP32 group epilogue and its waits | 465,585 | 24.5% |
+| Other work, loop setup and synchronization | 310,710 | 16.3% |
+
+All harts spend 816,516–816,540 such cycles in the quantization regions.
+This is not an execution-unit utilization breakdown: queued matrix work can
+finish while scalar execution is already in an epilogue region. Likewise,
+the mean `vtmmu` commit-to-issue interval is 517.2 cycles and issue-to-result
+interval is 41.8 cycles, but these intervals overlap across instructions and
+harts; summing them would overcount elapsed time. Do not call the epilogue
+share pure conversion time or the submission share pure matrix compute time.
+
+The first optimization to test is shared, RVV-vectorized activation
+quantization, partitioned across harts once per projection rather than
+duplicated per output shard. Q/K/V additionally share one normalized input,
+and gate/up share another, so their packed activations and scales can be
+reused across projections too. Next investigate reducing group-result traffic
+and pipelining operand loads. The already tested epilogue interleaving gain
+is only 0.35%, so that alone cannot close the current 45.2% cycle gap. These
+are prioritized follow-up experiments, not claimed speedups.
+
+To collect bounded-size summaries without keeping gigabytes of raw events:
+
+```sh
+python3 T1/tools/profile-rtl.py \
+  --emulator /path/to/simulator --image /path/to/image.elf \
+  --output /path/to/new-profile --dump-range 0x82000000:0x847499c0
+```
+
+Use the dump range for the actual image, not this example unconditionally.
+`instructions.csv` records hart, PC, instruction count and following-retire
+gaps; `profile.json` records event counts and T1 queue/result intervals.
+Check the complete readback and MMIO cycles against the original run.
+For the measured VME ELF, the seven half-open quantization PC ranges are
+`801004ea:801005ac`, `8010099c:80100a60`, `80100e32:80100efa`,
+`801019e0:80101aa8`, `8010216e:80102236`, `801025ee:801026b6`,
+and `80102d94:80102e5c` (hex). The epilogue ranges are
+`801006a8:80100708`, `80100b58:80100bba`, `80100ffa:80101064`,
+`80101ba0:80101c0a`, `8010233e:801023aa`, `801027be:8010282a`,
+and `80102f64:80102fd0`. Re-derive ranges from disassembly after code changes.
+
 ### Confirmed scalar-to-vector correctness failure
 
 The four-hart synthetic single-token layer differs between the previously
