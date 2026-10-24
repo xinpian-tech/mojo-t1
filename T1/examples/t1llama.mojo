@@ -30,7 +30,7 @@
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_dim
 from max.gpu.sync import barrier
-from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, matrix_submit, matrix_finish
+from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, matrix_submit, matrix_finish, quantize_group32
 from std.memory import unsafe_stack_allocation
 from std.collections import Dict
 from std.io.file import FileHandle
@@ -460,6 +460,37 @@ def _matmul(
     rows: Int, outputs: Int, reduction: Int, input_stride: Int, output_stride: Int,
 ):
     """Projects independent token rows, sharing group-32 weights within each tile."""
+    _matmul_prepared[False](out_ptr, weights, inputs, rows, outputs, reduction, input_stride, output_stride, inputs)
+
+
+@always_inline
+def _prepare_activations(inputs: F32Ptr, workspace: F32Ptr, rows: Int, reduction: Int, input_stride: Int):
+    """Cooperatively quantizes up to four rows into shared K-major group tiles."""
+    comptime if USE_VME and PREFILL_GEMM:
+        var groups = reduction // 32
+        var packed = workspace.bitcast[UInt8]()
+        var scales = workspace.unsafe_offset(reduction)
+        for task in range(thread_idx.x, groups * rows, block_dim.x):
+            var group = task // rows
+            var row = task % rows
+            scales[group * 4 + row] = quantize_group32(
+                inputs.unsafe_offset(row * input_stride + group * 32),
+                packed.unsafe_offset(group * 128 + row), 4,
+            )
+        barrier()
+
+
+@always_inline
+def _matmul_prepared[prepared: Bool = True](
+    out_ptr: F32Ptr, weights: F32Ptr, inputs: F32Ptr,
+    rows: Int, outputs: Int, reduction: Int, input_stride: Int, output_stride: Int,
+    workspace: F32Ptr,
+):
+    """Projects rows using shared prepared activations, or the scalar reference packer.
+
+    The prepared path accepts one to four rows and requires a completed
+    _prepare_activations call for these inputs. All harts participate.
+    """
     comptime if not USE_VME or not PREFILL_GEMM:
         for row in range(rows):
             _matvec(
@@ -467,8 +498,8 @@ def _matmul(
                 inputs.unsafe_offset(row * input_stride), outputs, reduction,
             )
     else:
-        var quantized = unsafe_stack_allocation[32, DType.uint32]().bitcast[UInt8]()
-        var activation_scales = unsafe_stack_allocation[4, DType.float32]()
+        var quantized = unsafe_stack_allocation[32, DType.uint32]().bitcast[UInt8]().as_unsafe_any_origin()
+        var activation_scales = unsafe_stack_allocation[4, DType.float32]().as_unsafe_any_origin()
         var accumulator = unsafe_stack_allocation[256, DType.int32]()
         var packed = weights.bitcast[Int8]()
         var scales = weights.unsafe_offset(outputs * reduction // 4)
@@ -481,17 +512,21 @@ def _matmul(
                 for column in range(first, last):
                     out_ptr[(row_base + row) * output_stride + column] = 0
             for group in range(reduction // 32):
-                for row in range(row_count):
-                    var source = inputs.unsafe_offset((row_base + row) * input_stride + group * 32)
-                    var magnitude = Float32(0)
-                    for inner in range(32):
-                        magnitude = max(magnitude, abs(source[inner]))
-                    var scale = magnitude / 127 if magnitude > 0 else Float32(1)
-                    activation_scales[row] = scale
-                    for inner in range(32):
-                        var value = source[inner] / scale
-                        var rounded = Int(value + (Float32(0.5) if value >= 0 else Float32(-0.5)))
-                        quantized[inner * 4 + row] = UInt8(max(-127, min(127, rounded)) + 128)
+                comptime if prepared:
+                    quantized = workspace.bitcast[UInt8]().unsafe_offset(group * 128)
+                    activation_scales = workspace.unsafe_offset(reduction + group * 4)
+                else:
+                    for row in range(row_count):
+                        var source = inputs.unsafe_offset((row_base + row) * input_stride + group * 32)
+                        var magnitude = Float32(0)
+                        for inner in range(32):
+                            magnitude = max(magnitude, abs(source[inner]))
+                        var scale = magnitude / 127 if magnitude > 0 else Float32(1)
+                        activation_scales[row] = scale
+                        for inner in range(32):
+                            var value = source[inner] / scale
+                            var rounded = Int(value + (Float32(0.5) if value >= 0 else Float32(-0.5)))
+                            quantized[inner * 4 + row] = UInt8(max(-127, min(127, rounded)) + 128)
                 var previous = first
                 var previous_count = 0
                 var slot = 0
@@ -929,7 +964,8 @@ def t1_prefill_layer(
 
     The header position is the first token position. Residual and RoPE rows
     are contiguous. Scratch holds xb[rows,dim], q[rows,dim], hb[rows,hidden],
-    hb2[rows,hidden], and att[THREADS,seq_cap]. KV uses the decode layout.
+    hb2[rows,hidden], att[THREADS,seq_cap], and shared packed activations
+    (max(dim,hidden) * 9 // 8 Float32 words). KV uses the decode layout.
     """
     comptime W = simd_width_of[DType.float32]()
     var rows = Int(token_count)
@@ -955,12 +991,14 @@ def t1_prefill_layer(
     var gate = sc.unsafe_offset(2 * rows * dim)
     var up = sc.unsafe_offset(2 * rows * dim + rows * hidden)
     var att = sc.unsafe_offset(2 * rows * (dim + hidden) + thread_idx.x * seq_cap)
+    var workspace = sc.unsafe_offset(2 * rows * (dim + hidden) + block_dim.x * seq_cap)
     var value_cache = kv.unsafe_offset(seq_cap * kv_dim)
     for row in range(rows):
         _rmsnorm(xb.unsafe_offset(row * dim), x.unsafe_offset(row * dim), w, dim)
-    _matmul(query, w.unsafe_offset(o_wq), xb, rows, dim, dim, dim, dim)
-    _matmul(kv.unsafe_offset(start * kv_dim), w.unsafe_offset(o_wk), xb, rows, kv_dim, dim, dim, kv_dim)
-    _matmul(value_cache.unsafe_offset(start * kv_dim), w.unsafe_offset(o_wv), xb, rows, kv_dim, dim, dim, kv_dim)
+    _prepare_activations(xb, workspace, rows, dim, dim)
+    _matmul_prepared(query, w.unsafe_offset(o_wq), xb, rows, dim, dim, dim, dim, workspace)
+    _matmul_prepared(kv.unsafe_offset(start * kv_dim), w.unsafe_offset(o_wk), xb, rows, kv_dim, dim, dim, kv_dim, workspace)
+    _matmul_prepared(value_cache.unsafe_offset(start * kv_dim), w.unsafe_offset(o_wv), xb, rows, kv_dim, dim, dim, kv_dim, workspace)
     for row in range(rows):
         for head in range(thread_idx.x, n_heads, block_dim.x):
             _rope_head(query.unsafe_offset(row * dim + head * hs), rope.unsafe_offset(row * hs), hs)
@@ -994,12 +1032,14 @@ def t1_prefill_layer(
                     att[previous] * inverse, hs,
                 )
     barrier()
-    _matmul(query, w.unsafe_offset(o_wo), xb, rows, dim, dim, dim, dim)
+    _prepare_activations(xb, workspace, rows, dim, dim)
+    _matmul_prepared(query, w.unsafe_offset(o_wo), xb, rows, dim, dim, dim, dim, workspace)
     for row in range(rows):
         _vadd(x.unsafe_offset(row * dim), query.unsafe_offset(row * dim), dim)
         _rmsnorm(xb.unsafe_offset(row * dim), x.unsafe_offset(row * dim), w.unsafe_offset(o_rms_ffn), dim)
-    _matmul(gate, w.unsafe_offset(o_w1), xb, rows, hidden, dim, dim, hidden)
-    _matmul(up, w.unsafe_offset(o_w3), xb, rows, hidden, dim, dim, hidden)
+    _prepare_activations(xb, workspace, rows, dim, dim)
+    _matmul_prepared(gate, w.unsafe_offset(o_w1), xb, rows, hidden, dim, dim, hidden, workspace)
+    _matmul_prepared(up, w.unsafe_offset(o_w3), xb, rows, hidden, dim, dim, hidden, workspace)
     for row in range(rows):
         var element = hidden * thread_idx.x // block_dim.x
         var last = hidden * (thread_idx.x + 1) // block_dim.x
@@ -1016,7 +1056,8 @@ def t1_prefill_layer(
             gate[offset] = value / (Float32(1) + exp(-value)) * up[offset]
             element += 1
     barrier()
-    _matmul(xb, w.unsafe_offset(o_w2), gate, rows, dim, hidden, hidden, dim)
+    _prepare_activations(gate, workspace, rows, hidden, hidden)
+    _matmul_prepared(xb, w.unsafe_offset(o_w2), gate, rows, dim, hidden, hidden, dim, workspace)
     for row in range(rows):
         _vadd(x.unsafe_offset(row * dim), xb.unsafe_offset(row * dim), dim)
 
@@ -1307,7 +1348,7 @@ def main() raises:
         + cfg.dim * cfg.dim + cfg.dim + 3 * cfg.dim * cfg.hidden
     )
     var head_words = cfg.dim + cfg.vocab * cfg.dim
-    var sc_words = PREFILL_BATCH * (2 * cfg.dim + 2 * cfg.hidden) + THREADS * seq_cap
+    var sc_words = PREFILL_BATCH * (2 * cfg.dim + 2 * cfg.hidden) + THREADS * seq_cap + max(cfg.dim, cfg.hidden) * 9 // 8
 
     # --- Device setup (standard Mojo DeviceContext API) -------------------
     var ctx = DeviceContext(api="t1")

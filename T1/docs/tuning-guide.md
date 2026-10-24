@@ -9,9 +9,12 @@ throughput, latency or VRF-port limits from the older blastoise setup
 without measuring the actual configuration.
 
 The T1 README records a historical TinyLlama single-token RVV/VME
-comparison and two Stories15M four-token prefill comparisons. VME GEMM
-improves over equal-precision VME GEMV by 1.762x, but still takes 45.2% more
-cycles than the existing FP32 RVV path. RVV versus VME compares different
+comparison and Stories15M four-token prefill comparisons. The original VME
+GEMM improves over equal-precision VME GEMV by 1.762x, but takes 45.2% more
+cycles than the existing FP32 RVV path before shared quantization. Shared RVV
+packing and Q/K/V plus gate/up reuse reduce VME to 1,191,922 cycles: 37.3%
+below the original VME GEMM and 9.0% below the existing RVV baseline.
+RVV versus VME compares different
 precisions; GEMV versus GEMM uses the same group-32 quantization. None is
 full-inference acceptance, and results from different models/token counts
 are not ratios of the same workload.
@@ -79,6 +82,20 @@ its own activation scale and the existing per-output weight scale and sum.
 Quantization groups cannot be merged into one integer accumulation when their
 scales differ.
 
+The production prefill path cooperatively quantizes each input group once:
+harts partition `(group, token)` tasks, use RVV max reduction/division/rounding
+and strided byte stores, then synchronize before consuming the shared pack.
+Q/K/V reuse one pack and gate/up reuse another. Attention output and the
+post-SwiGLU input each receive their own pack. The four passes process 6,528
+elements for four-token Stories15M, versus 39,936 in the original per-hart,
+per-projection scalar packer. These are element counts, not cycle ratios.
+The appended workspace occupies `max(dim, hidden) * 9 // 8` FP32 words:
+four byte-packed rows plus four FP32 scales per 32-element group. Division,
+ties-away-from-zero rounding, RTZ conversion and clipping remain unchanged;
+no reciprocal approximation or quantization precision change is introduced.
+The generic `_matmul` and single-token GEMV retain the scalar packer as
+independent references; shared packing currently optimizes prefill only.
+
 Q/K/V and FFN projections use this GEMM path. RoPE uses each token's actual
 position; attention reads only positions up to that token, even though the
 whole batch's K/V projections have already been written. The classifier runs
@@ -108,7 +125,7 @@ same-hart execution overlap.
 
 ## Interpreting measurements
 
-### Why the current VME prefill remains slower than RVV
+### Original VME slowdown: scalar-packing baseline
 
 A complete, streamed trace of the same measured Stories15M first-layer ELFs
 reproduces the original 1,901,030 VME and 1,309,351 RVV kernel cycles. Both
@@ -171,14 +188,12 @@ interval is 41.8 cycles, but these intervals overlap across instructions and
 harts; summing them would overcount elapsed time. Do not call the epilogue
 share pure conversion time or the submission share pure matrix compute time.
 
-The first optimization to test is shared, RVV-vectorized activation
-quantization, partitioned across harts once per projection rather than
-duplicated per output shard. Q/K/V additionally share one normalized input,
-and gate/up share another, so their packed activations and scales can be
-reused across projections too. Next investigate reducing group-result traffic
-and pipelining operand loads. The already tested epilogue interleaving gain
-is only 0.35%, so that alone cannot close the current 45.2% cycle gap. These
-are prioritized follow-up experiments, not claimed speedups.
+This diagnosis motivated the shared RVV quantization and cross-projection
+reuse now implemented in the prefill path. The counts and PC ranges in this
+section describe the original scalar-packing ELF, not the optimized kernel.
+Reducing group-result traffic and pipelining operand loads remain follow-up
+work. The separately tested epilogue interleaving gain was only 0.35%; that
+experiment did not address the redundant scalar packing.
 
 To collect bounded-size summaries without keeping gigabytes of raw events:
 

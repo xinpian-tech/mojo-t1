@@ -4,6 +4,54 @@ from std.sys import inlined_assembly
 
 
 @always_inline
+def quantize_group32[input_origin: MutOrigin, output_origin: MutOrigin, //](
+    source: Pointer[Float32, input_origin], destination: Pointer[UInt8, output_origin],
+    stride: Int,
+) -> Float32:
+    """Packs 32 finite FP32 values with symmetric scaling and ties away from zero.
+
+    Requires VLEN >= 1024. Destination has room for 32 strided bytes.
+    Division and RTZ conversion preserve the scalar group-32 quantizer.
+    """
+    var magnitude = inlined_assembly[
+        "li t0, 32\n"
+        "vsetvli zero, t0, e32, m1, ta, ma\n"
+        "vle32.v v8, ($1)\n"
+        "vfabs.v v9, v8\n"
+        "vmv.s.x v10, zero\n"
+        "vfredmax.vs v10, v9, v10\n"
+        "vfmv.f.s $0, v10\n",
+        Float32,
+        constraints="=f,r,~{t0},~{v8},~{v9},~{v10},~{memory}",
+    ](source)
+    var scale = magnitude / 127 if magnitude > 0 else Float32(1)
+    inlined_assembly[
+        "li t0, 32\n"
+        "vsetvli zero, t0, e32, m1, ta, ma\n"
+        "vle32.v v8, ($0)\n"
+        "vfdiv.vf v8, v8, $3\n"
+        "vfmv.v.f v10, $4\n"
+        "vfsgnj.vv v10, v10, v8\n"
+        "vfadd.vv v8, v8, v10\n"
+        "vfcvt.rtz.x.f.v v12, v8\n"
+        "li t1, -127\n"
+        "vmax.vx v12, v12, t1\n"
+        "li t1, 127\n"
+        "vmin.vx v12, v12, t1\n"
+        "li t1, 128\n"
+        "vadd.vx v12, v12, t1\n"
+        "vsetvli zero, t0, e16, m1, ta, ma\n"
+        "vnsrl.wi v10, v12, 0\n"
+        "vsetvli zero, t0, e8, m1, ta, ma\n"
+        "vnsrl.wi v8, v10, 0\n"
+        "vsse8.v v8, ($1), $2\n",
+        NoneType,
+        constraints="r,r,r,f,f,~{t0},~{t1},~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{memory}",
+    ](source, destination, stride, scale, Float32(0.5))
+    return scale
+
+
+@always_inline
 def matrix_u8_i8[
     output_origin: MutOrigin, weight_origin: MutOrigin, input_origin: MutOrigin, //
 ](

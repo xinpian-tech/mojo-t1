@@ -61,7 +61,7 @@ def main() raises:
     var x = context.enqueue_create_buffer[DType.float32](ROWS * DIM)
     var weights = context.enqueue_create_buffer[DType.float32](LAYER_WORDS)
     var kv = context.enqueue_create_buffer[DType.float32](2 * SEQ_CAP * KV_DIM)
-    var scratch = context.enqueue_create_buffer[DType.float32](2 * ROWS * (DIM + HIDDEN) + 4 * SEQ_CAP)
+    var scratch = context.enqueue_create_buffer[DType.float32](2 * ROWS * (DIM + HIDDEN) + 4 * SEQ_CAP + max(DIM, HIDDEN) * 9 // 8)
     var initial_x = List[Float32](length=ROWS * DIM, fill=0)
     var initial_kv = List[Float32](length=2 * SEQ_CAP * KV_DIM, fill=0)
     for row in range(ROWS):

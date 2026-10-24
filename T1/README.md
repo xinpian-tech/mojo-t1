@@ -217,18 +217,22 @@ Run `t1llama` and `t1llama-prefill-serial` with the same model, tokenizer,
 prompt and `12 --first-layer-only`; preserve each run's directory and compare:
 
 ```sh
-python3 T1/tools/compare-layer-rtl.py --prefill --require-identical-readback \
+python3 T1/tools/compare-layer-rtl.py --prefill \
   --baseline /path/to/serial-rtl --candidate /path/to/gemm-rtl \
   --baseline-reference /path/to/serial-isa/memdump.bin \
   --candidate-reference /path/to/gemm-isa/memdump.bin
 ```
+
+The historical package above also supports `--require-identical-readback`.
+Current shared packing writes additional scratch data, so compare residual
+and KV buffers rather than requiring identical scratch between the paths.
 
 `t1-prefill --tokens N` checks a synthetic layer with 1–4 tokens, a nonzero
 starting position, grouped-query attention and full residual/KV comparison
 against sequential execution. This is a layer-correctness test, not a
 full-model acceptance claim.
 
-### VME versus pure RVV on the same prefill layer
+### Original VME versus pure RVV on the same prefill layer
 
 Using the same Stories15M layer 0, positions 0–3, prompt, four harts and
 RAW-repaired simulator as above, `t1llama-rvv` (`T1_VME=0`) measures:
@@ -238,7 +242,7 @@ RAW-repaired simulator as above, `t1llama-rvv` (`T1_VME=0`) measures:
 | Pure RVV, FP32 projections | 1,309,351 | 1,309,664 |
 | VME GEMM, group-32 INT8 projections | 1,901,030 | 1,901,340 |
 
-**VME still takes 1.452x as many kernel cycles as RVV (45.2% more).**
+**Before shared activation packing, VME takes 1.452x as many kernel cycles as RVV (45.2% more).**
 The 1.762x improvement above is relative to VME GEMV, not to RVV. This
 comparison includes activation quantization, matrix/vector operations and
 synchronization, but excludes host packing and simulator startup. The RVV
@@ -258,6 +262,48 @@ python3 T1/tools/compare-layer-rtl.py \
   --rvv-reference /path/to/rvv-isa/memdump.bin \
   --vme-reference /path/to/gemm-isa/memdump.bin
 ```
+
+### Shared RVV activation packing
+
+The production prefill path now distributes group quantization across harts,
+uses RVV rather than scalar element loops, and reuses packed inputs/scales
+across Q/K/V and gate/up. The group-32 arithmetic and weight format are
+unchanged; single-token decode still uses the original GEMV path.
+
+Stories15M layer 0, positions 0–3, the same prompt and the same four-hart
+RAW-repaired simulator (`90641f92` plus the existing corrections) measure:
+
+| Path | Kernel cycles | Total simulator cycles |
+| --- | ---: | ---: |
+| Existing pure RVV, FP32 projections | 1,309,351 | 1,309,664 |
+| Original VME GEMM, private scalar packing | 1,901,030 | 1,901,340 |
+| VME GEMM, shared RVV packing and reuse | 1,191,922 | 1,192,235 |
+
+The software change gives **1.595x speedup over the original VME GEMM**
+(37.3% fewer cycles). Against the existing FP32 RVV baseline it gives
+**1.099x speedup, or 9.0% fewer cycles**. This is a single-layer prefill
+comparison, not full-model or decode performance, and not a comparison
+against a separately optimized RVV GEMM. RVV and VME retain different
+projection precisions.
+
+The optimized complete 41,199,424-byte RTL readback matches its ISA reference,
+SHA-256 `145bb548c3336c853cc93a6efbe380bc74274cb1162d3089e510f6462f9e164b`.
+The residual, full KV buffers and original scratch contents are byte-identical
+to the old VME result after accounting for the added 3,456-byte workspace and
+shifted downstream allocations. Whole old/new dumps are therefore not directly
+byte-comparable. Preserved runs are `/tmp/shared-quant-stories-rtl` and
+`/tmp/shared-quant-stories-model`; the old RVV runs remain
+`/tmp/final-stories-rvv-rtl` and `/tmp/final-stories-rvv-model`.
+
+Built using `nix build .#t1 -o /tmp/mojo-t1-shared-quant-final`; only the T1
+overlay and extension package rebuild, not upstream Mojo. The package is
+`/nix/store/x2j7nm08mizc4b5g5f0zaaglh8nlxi90-mojo-t1-0.1.0`.
+Its layer ELFs and ISA dumps are byte-identical to the measured package;
+the final quantized microtest additionally covers positive/negative halfway
+rounding and values just below halfway, with padded strides, a zero row,
+row/column tails and shared-versus-scalar output comparison.
+All three quantized microtest variants and synthetic prefill token counts
+1–4 pass on the repaired RTL, with complete dumps matching their ISA runs.
 
 ### Historical single-token VME performance evaluation
 
