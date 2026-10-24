@@ -138,21 +138,29 @@ def matrix_finish[output_origin: MutOrigin, //](
     The final fence orders all result stores before subsequent memory work.
     Rows, columns and element stride follow matrix_u8_i8's contract.
     """
-    for row in range(rows):
-        inlined_assembly[
-            "li t0, 1155\n"
-            "li t1, 256\n"
-            ".word 0x8462f057\n"
-            "mv t0, $1\n"
-            ".word 0x8802f057\n"
-            "mv a0, $0\n"
-            "li a1, 0x20000000\n"
-            "or a1, a1, $2\n"
-            ".word 0x52b57027\n",
-            NoneType,
-            constraints="r,r,r,~{t0},~{t1},~{a0},~{a1},~{memory}",
-        ](output.unsafe_offset(row * output_stride), columns, row)
-    inlined_assembly["fence iorw, iorw", NoneType, constraints="~{memory}"]()
+    inlined_assembly[
+        "mv t2, $0\n"
+        "mv t3, $1\n"
+        "slli t4, $3, 2\n"
+        "li t5, 0\n"
+        "li t0, 1155\n"
+        "li t1, 256\n"
+        ".word 0x8462f057\n"
+        "mv t0, $2\n"
+        ".word 0x8802f057\n"
+        "1:\n"
+        "mv a0, t2\n"
+        "li a1, 0x20000000\n"
+        "or a1, a1, t5\n"
+        ".word 0x52b57027\n"
+        "add t2, t2, t4\n"
+        "addi t5, t5, 1\n"
+        "addi t3, t3, -1\n"
+        "bnez t3, 1b\n"
+        "fence iorw, iorw\n",
+        NoneType,
+        constraints="r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{a0},~{a1},~{memory}",
+    ](output, rows, columns, output_stride)
 
 
 @always_inline

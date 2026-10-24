@@ -340,6 +340,22 @@ Synthetic prefill token counts 1–4 and blocking/interleaved quantized GEMM
 pass RTL assertions and complete ISA readback comparisons. The scalar GEMV
 reference ELF is unchanged from the preceding validated package.
 
+### Configuring tile stores once per result
+
+`matrix_finish` now configures the matrix type and row length once, then
+stores all tile rows using their TSS row selectors. No intervening operation
+changes `vl` or `mtype`; Zvt does not require reconfiguration per row.
+The same Stories15M layer decreases from 1,127,926 to **1,118,944 kernel
+cycles** (0.80% fewer); total simulator cycles are 1,119,257. The complete
+readback remains byte-identical to the preceding optimized VME versions.
+
+Integer GEMM, single-row GEMM, blocking/interleaved quantized GEMM and
+synthetic prefill token counts 1–4 pass repaired RTL against their complete
+ISA readbacks. Runs are preserved under `/tmp/store-config-*-rtl` and
+`/tmp/store-config-*-model`; the measured Nix package is
+`/nix/store/44vyrc0a8rkzn3g1rkf32jswrgk1a4sy-mojo-t1-0.1.0`, built with
+`nix build .#t1 -o /tmp/mojo-t1-store-config`.
+
 ### Historical single-token VME performance evaluation
 
 The TinyLlama 1.1B first transformer layer at position 0 completes on the
