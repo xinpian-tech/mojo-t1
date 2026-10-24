@@ -1,0 +1,36 @@
+diff --git a/designs/blastoise.toml b/designs/blastoise.toml
+index d0fec36..259a7c0 100644
+--- a/designs/blastoise.toml
++++ b/designs/blastoise.toml
+@@ -17,8 +17,8 @@ cmdopt = [
+   "--extensions=zve32f",
+   "--laneScale=2",
+   "--chainingSize=4",
+-  "--vrfBankSize=4",
+-  "--vrfRamType=p0rw",
++  "--vrfBankSize=8",
++  "--vrfRamType=p0rp1w",
+   "--vfuInstantiateParameter=small",
+   "--extensions=zvbb",
+ ]
+@@ -49,8 +49,8 @@ cmdopt = [
+   "--dLen=256",
+   "--laneScale=2",
+   "--chainingSize=4",
+-  "--vrfBankSize=4",
+-  "--vrfRamType=p0rw",
++  "--vrfBankSize=8",
++  "--vrfRamType=p0rp1w",
+   "--vfuInstantiateParameter=small",
+ ]
+ 
+@@ -80,7 +80,7 @@ cmdopt = [
+   "--dLen=256",
+   "--laneScale=2",
+   "--chainingSize=4",
+-  "--vrfBankSize=4",
+-  "--vrfRamType=p0rw",
++  "--vrfBankSize=8",
++  "--vrfRamType=p0rp1w",
+   "--vfuInstantiateParameter=small",
+ ]

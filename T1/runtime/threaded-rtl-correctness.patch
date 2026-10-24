@@ -1,0 +1,40 @@
+diff --git a/rocketvzaozi/src/Rocket.scala b/rocketvzaozi/src/Rocket.scala
+index 9083e9a8..7ada8973 100644
+--- a/rocketvzaozi/src/Rocket.scala
++++ b/rocketvzaozi/src/Rocket.scala
+@@ -2317 +2317 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+-                              (!(dmemResponseReplay & dmemResponseFpu) | !vectorTryToWriteFP)
++                              (!(dmemResponseValid & dmemResponseFpu) | !vectorTryToWriteFP)
+@@ -2319,0 +2320 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
++                            mulDivRespReady     := false.B
+diff --git a/t1zaozi/src/SRTFPWrapper.scala b/t1zaozi/src/SRTFPWrapper.scala
+index 72279187..a769e2f9 100644
+--- a/t1zaozi/src/SRTFPWrapper.scala
++++ b/t1zaozi/src/SRTFPWrapper.scala
+@@ -282 +282 @@ object SRTFPWrapper
+-    val muxSel = opSqrtReg | (io.input.bits.opSqrt & inputFire)
++    val muxSel = inputFire ? (io.input.bits.opSqrt, opSqrtReg)
+@@ -336 +336 @@ object SRTFPWrapper
+-    divIter.io.input.bits.counter      := (opFloatReg | (io.input.bits.opFloat & inputFire)) ? (
++    divIter.io.input.bits.counter      := (inputFire ? (io.input.bits.opFloat, opFloatReg)) ? (
+diff --git a/t1zaozi/src/laneStage/LaneStageDataflow.scala b/t1zaozi/src/laneStage/LaneStageDataflow.scala
+index b9d0ce9e..d8b59c4e 100644
+--- a/t1zaozi/src/laneStage/LaneStageDataflow.scala
++++ b/t1zaozi/src/laneStage/LaneStageDataflow.scala
+@@ -34,11 +34,3 @@ object LaneImplStageDataflow:
+-      val held       = RegInit(false.B)
+-      val heldLoad   = Reg(Bool())
+-      val selected   = held ? (
+-        heldLoad,
+-        loadReturn.valid &
+-          (!s0Io.dequeue.valid | preferLoad |
+-            (s0Io.dequeue.bits.instructionIndex.asBits === loadReturn.bits.instructionIndex.asBits))
+-      )
+-      when(s1Io.enqueue.valid & !s1Io.enqueue.ready):
+-        held     := true.B
+-        heldLoad := selected
++      val selected   = loadReturn.valid &
++        (!s0Io.dequeue.valid | preferLoad |
++          (s0Io.dequeue.bits.instructionIndex.asBits === loadReturn.bits.instructionIndex.asBits))
+@@ -46 +37,0 @@ object LaneImplStageDataflow:
+-        held       := false.B

@@ -1,0 +1,33 @@
+diff --git a/difftest/dpi_t1rocketemu/src/addrspace.rs b/difftest/dpi_t1rocketemu/src/addrspace.rs
+index 33d4828d..c1b4f6ab 100644
+--- a/difftest/dpi_t1rocketemu/src/addrspace.rs
++++ b/difftest/dpi_t1rocketemu/src/addrspace.rs
+@@ -66,0 +67,9 @@ impl AddressSpace {
++  pub fn dump_range(&mut self, addr: u32, len: u32, path: &Path) {
++    assert!(len > 0 && addr.checked_add(len).is_some(), "invalid memory dump range");
++    let device_idx = self.find_device_idx(addr, len).expect("memory dump outside device RAM");
++    let entry = &mut self.devices[device_idx];
++    let offset = (addr - entry.base_and_size.0) as usize;
++    let ram = entry.device.as_ram_mut().expect("memory dump requires a RAM device");
++    std::fs::write(path, &ram[offset..offset + len as usize]).expect("memory dump write failed");
++  }
++
+diff --git a/difftest/dpi_t1rocketemu/src/dpi.rs b/difftest/dpi_t1rocketemu/src/dpi.rs
+index 920f211a..31192370 100644
+--- a/difftest/dpi_t1rocketemu/src/dpi.rs
++++ b/difftest/dpi_t1rocketemu/src/dpi.rs
+@@ -314 +314 @@ unsafe extern "C" fn t1_cosim_final(target: *mut Target) {
+-  let Ok(driver) = target.into_inner() else {
++  let Ok(mut driver) = target.into_inner() else {
+@@ -319,0 +320,11 @@ unsafe extern "C" fn t1_cosim_final(target: *mut Target) {
++  if success {
++    let arguments = dpi_common::plusarg::PlusArgMatcher::from_args();
++    if let Some(path) = arguments.try_match("t1_memory_dump_path") {
++      let range = arguments.match_("t1_memory_dump_range");
++      let (start, end) = range.split_once(':').expect("memory dump range must be START:END");
++      let start = u32::from_str_radix(start.trim_start_matches("0x"), 16).expect("invalid dump start");
++      let end = u32::from_str_radix(end.trim_start_matches("0x"), 16).expect("invalid dump end");
++      assert!(end > start, "empty or reversed memory dump range");
++      driver.addr_space.dump_range(start, end - start, std::path::Path::new(path));
++    }
++  }

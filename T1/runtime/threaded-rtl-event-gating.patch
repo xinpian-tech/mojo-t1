@@ -1,0 +1,15 @@
+diff --git a/t1rocketemu/vsrc/T1RocketEmuTop.sv b/t1rocketemu/vsrc/T1RocketEmuTop.sv
+index 8044b0e7..5ca3f95b 100644
+--- a/t1rocketemu/vsrc/T1RocketEmuTop.sv
++++ b/t1rocketemu/vsrc/T1RocketEmuTop.sv
+@@ -194,0 +195 @@ module T1RocketEmuTop;
++    .rtlEventEnable(__circt_lib_logging::log_fd != 0),
+diff --git a/t1rocketzaozi/src/TestBench.scala b/t1rocketzaozi/src/TestBench.scala
+index 9f4c795a..89ea5e32 100644
+--- a/t1rocketzaozi/src/TestBench.scala
++++ b/t1rocketzaozi/src/TestBench.scala
+@@ -47,0 +48 @@ class TestBenchInterface(parameter: T1RocketTileParameter) extends HWBundle(para
++  val rtlEventEnable: BundleField[Bool] = Flipped(Bool())
+@@ -330 +331 @@ object TestBench extends Generator[T1RocketTileParameter, TestBenchLayers, TestB
+-      when(cond) {
++      when(cond & io.rtlEventEnable) {

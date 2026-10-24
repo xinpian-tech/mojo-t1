@@ -1,0 +1,396 @@
+diff --git a/difftest/dpi_t1rocketemu/src/addrspace.rs b/difftest/dpi_t1rocketemu/src/addrspace.rs
+index 33d4828..bc377a3 100644
+--- a/difftest/dpi_t1rocketemu/src/addrspace.rs
++++ b/difftest/dpi_t1rocketemu/src/addrspace.rs
+@@ -133,6 +133,19 @@ impl AddressSpace {
+     dst[data.len()..].fill(0);
+   }
+ 
++  /// Writes [addr, addr+len) of a RAM-backed device to a file.  Used by the
++  /// batch runtime to read results back with zero simulation-cycle cost.
++  pub fn dump_range(&mut self, addr: u32, len: u32, path: &std::path::Path) {
++    let Some(device_idx) = self.find_device_idx(addr, len) else {
++      panic!("memdump: interconnect decode error, addr=0x{addr:08x}, len={len}B")
++    };
++    let dev_entry = &mut self.devices[device_idx];
++    let offset = (addr - dev_entry.base_and_size.0) as usize;
++    let ram = dev_entry.device.as_ram_mut().expect("memdump: device is not RAM");
++    std::fs::write(path, &ram[offset..offset + len as usize]).expect("memdump: write failed");
++    tracing::info!("memdump: wrote 0x{addr:08x}+{len}B to {}", path.display());
++  }
++
+   fn find_device_idx(&self, addr: u32, len: u32) -> Option<usize> {
+     for (idx, dev) in self.devices.iter().enumerate() {
+       let (base, size) = dev.base_and_size;
+diff --git a/difftest/dpi_t1rocketemu/src/drive.rs b/difftest/dpi_t1rocketemu/src/drive.rs
+index 2db94b0..bff2efe 100644
+--- a/difftest/dpi_t1rocketemu/src/drive.rs
++++ b/difftest/dpi_t1rocketemu/src/drive.rs
+@@ -299,6 +299,9 @@ pub(crate) struct Driver {
+   timeout: u64,
+   last_commit_cycle: u64,
+ 
++  /// +t1_memory_dump_path= / +t1_memory_dump_range=0xSTART:0xEND
++  memdump: Option<(String, u32, u32)>,
++
+   pub(crate) addr_space: AddressSpace,
+ 
+   /// (channel_id, id) -> data
+@@ -319,6 +322,16 @@ impl Driver {
+     let reset_vector = addr_space.reset_vector();
+     info!("ELF entry: 0x{_elf_entry:x}, reset vector (bootrom): 0x{reset_vector:x}");
+ 
++    let pm = dpi_common::plusarg::PlusArgMatcher::from_args();
++    let memdump = pm.try_match("t1_memory_dump_path").map(|path| {
++      let range = pm.match_("t1_memory_dump_range");
++      let (start_s, end_s) = range.split_once(':').expect("t1_memory_dump_range=0xSTART:0xEND");
++      let start = u32::from_str_radix(start_s.trim_start_matches("0x"), 16).expect("range start");
++      let end = u32::from_str_radix(end_s.trim_start_matches("0x"), 16).expect("range end");
++      assert!(end > start, "t1_memory_dump_range: end <= start");
++      (path.to_string(), start, end - start)
++    });
++
+     Self {
+       scope,
+ 
+@@ -336,6 +349,8 @@ impl Driver {
+       timeout: 0,
+       last_commit_cycle: 0,
+ 
++      memdump,
++
+       addr_space,
+ 
+       incomplete_reads: BTreeMap::new(),
+@@ -519,6 +534,9 @@ impl Driver {
+     if let Some(exit_code) = self.addr_space.exit_code() {
+       if exit_code == 0 {
+         trace!("[{tick}] watchdog quit");
++        if let Some((path, start, len)) = self.memdump.take() {
++          self.addr_space.dump_range(start, len, std::path::Path::new(&path));
++        }
+         return WATCHDOG_QUIT;
+       }
+ 
+diff --git a/pokedex/simulator/src/bus/elf.rs b/pokedex/simulator/src/bus/elf.rs
+index 185e5f5..5cc25fd 100644
+--- a/pokedex/simulator/src/bus/elf.rs
++++ b/pokedex/simulator/src/bus/elf.rs
+@@ -55,9 +55,12 @@ fn verify_expected_symbols(bus: &Bus, elf_file: &ElfFile<'_>) -> anyhow::Result<
+         return Ok(());
+     }
+ 
+-    let symtab = elf_file
+-        .find_section_by_name(".symtab")
+-        .ok_or_else(|| anyhow!("ELF missing .symtab section"))?;
++    // Batch images composed by an external runtime carry no section
++    // headers at all; the symbol addresses are fixed by the address map
++    // anyway, so treat a missing symtab as nothing to verify.
++    let Some(symtab) = elf_file.find_section_by_name(".symtab") else {
++        return Ok(());
++    };
+ 
+     let entries = match symtab.get_data(elf_file).map_err(|e| anyhow!("{e}"))? {
+         SectionData::SymbolTable32(entries) => entries,
+diff --git a/pokedex/simulator/src/bus/mod.rs b/pokedex/simulator/src/bus/mod.rs
+index 960f7fd..da96ccb 100644
+--- a/pokedex/simulator/src/bus/mod.rs
++++ b/pokedex/simulator/src/bus/mod.rs
+@@ -13,7 +13,7 @@ mod bootrom;
+ mod elf;
+ mod htif;
+ mod spike;
+-mod t1emu;
++pub mod t1emu;
+ 
+ pub struct Bus {
+     address_space: Vec<(Range<u32>, Box<dyn Addressable>)>,
+@@ -36,6 +36,14 @@ impl Bus {
+         t1emu::new()
+     }
+ 
++    /// T1RocketEmu compatible bus that records PERF MMIO writes.
++    pub fn new_t1emu_with_perf(
++        events: t1emu::PerfEvents,
++        icount: std::sync::Arc<std::sync::atomic::AtomicU64>,
++    ) -> Self {
++        t1emu::new_with_perf(events, icount)
++    }
++
+     // return ELF entrypoint if success
+     pub fn load_elf(&mut self, elf_path: &Path) -> anyhow::Result<u32> {
+         elf::load_elf(self, elf_path)
+diff --git a/pokedex/simulator/src/bus/t1emu.rs b/pokedex/simulator/src/bus/t1emu.rs
+index 6c61133..780e617 100644
+--- a/pokedex/simulator/src/bus/t1emu.rs
++++ b/pokedex/simulator/src/bus/t1emu.rs
+@@ -15,26 +15,36 @@
+ use super::bootrom::SpikeRom;
+ use super::{Addressable, Bus, BusError, NaiveMemory};
+ 
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
++/// (instruction count, value) pairs recorded from PERF MMIO writes.
++pub type PerfEvents = Arc<Mutex<Vec<(u64, u32)>>>;
++
+ const RESET_VECTOR: u32 = 0x0000_1000;
+ const ELF_ENTRY: u32 = 0x8000_0000;
+ 
+ pub fn new() -> Bus {
++    new_with_perf(Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicU64::new(0)))
++}
++
++/// Like [`new`], but PERF MMIO writes are recorded into `events`, stamped
++/// with the current value of `icount` (maintained by the run loop).
++pub fn new_with_perf(events: PerfEvents, icount: Arc<AtomicU64>) -> Bus {
+     let exit_state = Arc::new(AtomicU64::new(0));
+ 
+     let sram = NaiveMemory::new(0x2000_0000);
+ 
+     let rom = SpikeRom::new(ELF_ENTRY);
+     let htif = T1Htif::new(exit_state.clone());
++    let perf = Perf { events, icount };
+ 
+     Bus {
+         address_space: vec![
+             (0x8000_0000..0xA000_0000, Box::new(sram)),
+             (0x0000_1000..0x0000_2000, Box::new(rom)),
+             (0x0100_0000..0x0100_1000, Box::new(htif)),
+-            (0x0100_1000..0x0100_2000, Box::new(Perf)),
++            (0x0100_1000..0x0100_2000, Box::new(perf)),
+             (0x1000_0000..0x1000_1000, Box::new(Uart)),
+         ],
+         exit_state,
+@@ -99,9 +109,13 @@ impl Addressable for T1Htif {
+ /// Profile counter device at 0x0100_1000.
+ ///
+ /// In T1RocketEmu each 4-byte write to offset 0x0 records a "profile" event
+-/// and every other access faults. Pokedex does not replay these events, so
+-/// the write is simply accepted.
+-struct Perf;
++/// and every other access faults.  The write is recorded with the current
++/// retired-instruction count as the timestamp (a 1-IPC approximation of the
++/// RTL cycle number).
++struct Perf {
++    events: PerfEvents,
++    icount: Arc<AtomicU64>,
++}
+ 
+ impl Addressable for Perf {
+     fn do_bus_read(&mut self, _offset: u32, _dest: &mut [u8]) -> Result<(), BusError> {
+@@ -111,6 +125,9 @@ impl Addressable for Perf {
+     fn do_bus_write(&mut self, offset: u32, data: &[u8]) -> Result<(), BusError> {
+         // word access to offset 0x0 only
+         if offset == 0 && data.len() == 4 {
++            let value = u32::from_le_bytes(data.try_into().unwrap());
++            let now = self.icount.load(Ordering::Relaxed);
++            self.events.lock().unwrap().push((now, value));
+             Ok(())
+         } else {
+             Err(BusError::DeviceError { id: "PerfWrite" })
+diff --git a/pokedex/simulator/src/main.rs b/pokedex/simulator/src/main.rs
+index ae54ac7..05f50f7 100644
+--- a/pokedex/simulator/src/main.rs
++++ b/pokedex/simulator/src/main.rs
+@@ -57,6 +57,26 @@ struct RunArgs {
+     /// Path to the RISC-V ELF to execute
+     elf: PathBuf,
+ 
++    /// Machine model: "spike" (default) or "t1emu" (T1RocketEmu address map)
++    #[arg(long, default_value = "spike")]
++    machine: String,
++
++    /// Write [start, end) of memory to this file when the run exits cleanly
++    #[arg(long)]
++    memory_dump_path: Option<PathBuf>,
++
++    /// Memory dump range, formatted 0xSTART:0xEND
++    #[arg(long)]
++    memory_dump_range: Option<String>,
++
++    /// Record PERF MMIO writes (t1emu machine) as JSONL to this file
++    #[arg(long)]
++    perf_event_path: Option<PathBuf>,
++
++    /// Write an execution histogram (pc, count, first instruction word) CSV
++    #[arg(long)]
++    pc_histogram_path: Option<PathBuf>,
++
+     /// Path to the generated trace json log
+     #[arg(long, short)]
+     output: Option<PathBuf>,
+@@ -105,21 +125,32 @@ fn main() -> anyhow::Result<ExitCode> {
+     match &args.command {
+         Command::Run(args) => {
+             let output = if let Some(output) = &args.output {
+-                run::Output::JsonLog(output)
++                Some(run::Output::JsonLog(output))
+             } else if args.stdout {
+-                run::Output::Stdout
++                Some(run::Output::Stdout)
++            } else if args.machine == "t1emu" {
++                None // batch mode: no per-instruction trace
+             } else {
+                 bail!("neither --output nor --stdout is given");
+             };
+ 
+             env_logger::init();
+ 
++            let batch = run::BatchOptions {
++                machine: args.machine.clone(),
++                memory_dump_path: args.memory_dump_path.clone(),
++                memory_dump_range: args.memory_dump_range.clone(),
++                perf_event_path: args.perf_event_path.clone(),
++                pc_histogram_path: args.pc_histogram_path.clone(),
++            };
++
+             run::cli_command(
+                 &args.elf,
+                 output,
+                 args.model_lib.as_deref(),
+                 args.diff_spike_log.as_deref(),
+                 args.vlen,
++                &batch,
+             )
+         }
+         Command::DifftestT1(args) => {
+diff --git a/pokedex/simulator/src/run/mod.rs b/pokedex/simulator/src/run/mod.rs
+index 306d248..6caba0d 100644
+--- a/pokedex/simulator/src/run/mod.rs
++++ b/pokedex/simulator/src/run/mod.rs
+@@ -37,12 +37,23 @@ pub enum Output<'a> {
+     Stdout,
+ }
+ 
++/// Batch-execution options (t1emu machine): memory dump and PERF recording.
++#[derive(Debug, Clone, Default)]
++pub struct BatchOptions {
++    pub machine: String,
++    pub memory_dump_path: Option<std::path::PathBuf>,
++    pub memory_dump_range: Option<String>,
++    pub perf_event_path: Option<std::path::PathBuf>,
++    pub pc_histogram_path: Option<std::path::PathBuf>,
++}
++
+ pub fn cli_command(
+     elf: &Path,
+-    output: Output<'_>,
++    output: Option<Output<'_>>,
+     model_lib: Option<&OsStr>,
+     diff_spike_log: Option<&Path>,
+     vlen: u32,
++    batch: &BatchOptions,
+ ) -> anyhow::Result<ExitCode> {
+     // Safety: dlopen is unsafe intrinsicly
+     let modellib = unsafe {
+@@ -53,7 +64,15 @@ pub fn cli_command(
+         .create_spike(vlen)
+         .map_err(|e| anyhow!("model init failed ({e})"))?;
+ 
+-    let mut bus = Bus::new_spike();
++    let mut pc_hist: std::collections::HashMap<u32, (u64, u32)> =
++        std::collections::HashMap::new();
++    let want_hist = batch.pc_histogram_path.is_some();
++    let perf_events: crate::bus::t1emu::PerfEvents = Default::default();
++    let icount = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
++    let mut bus = match batch.machine.as_str() {
++        "t1emu" => Bus::new_t1emu_with_perf(perf_events.clone(), icount.clone()),
++        _ => Bus::new_spike(),
++    };
+     let entry = bus.load_elf(elf)?;
+     if let Some(expected_elf_entry) = bus.expected_elf_entry() {
+         // we check the elf entry is the same as the platform reset vector
+@@ -69,15 +88,12 @@ pub fn cli_command(
+         bail!("model bug: reset failed, reset_vector={reset_vector:#010x}");
+     }
+ 
+-    let mut output: Box<dyn std::io::Write> = match output {
+-        Output::Stdout => {
+-            Box::new(std::io::stdout())
+-        }
+-        Output::JsonLog(path) => {
+-            Box::new(BufWriter::new(
+-                std::fs::File::create(path)?
+-            ))
+-        }
++    let mut output: Option<Box<dyn std::io::Write>> = match output {
++        Some(Output::Stdout) => Some(Box::new(std::io::stdout())),
++        Some(Output::JsonLog(path)) => Some(Box::new(BufWriter::new(
++            std::fs::File::create(path)?,
++        ))),
++        None => None,
+     };
+ 
+     let mut spike_diff: Option<SpikeDiff<BufReader<File>>> = match diff_spike_log {
+@@ -116,6 +132,15 @@ pub fn cli_command(
+             }
+         };
+ 
++        icount.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        if want_hist {
++            let word = match inst {
++                Inst::I(bits) => bits,
++                Inst::C(bits) => bits as u32,
++            };
++            let e = pc_hist.entry(pc).or_insert((0, word));
++            e.0 += 1;
++        }
+         let step_state = match inst {
+             Inst::I(inst) => cpu.execute(pc, inst, &mut bus),
+             Inst::C(inst) => cpu.execute_compressed(pc, inst, &mut bus),
+@@ -123,10 +148,10 @@ pub fn cli_command(
+         step_state.expect("raise exception");
+ 
+         let trace = cpu.get_trace().expect("get_trace_buffer failed");
+-        let formatted_trace = trace::format_trace(&cpu, trace, pc, inst);
+-
+-        output.write_all(formatted_trace.as_bytes())
+-            .unwrap();
++        if let Some(output) = output.as_mut() {
++            let formatted_trace = trace::format_trace(&cpu, trace, pc, inst);
++            output.write_all(formatted_trace.as_bytes()).unwrap();
++        }
+ 
+         if let Some(spike) = &mut spike_diff {
+             let (spike_pc, spike_inst) = spike.step()?;
+@@ -150,6 +175,38 @@ pub fn cli_command(
+         }
+     };
+ 
++    if matches!(reason, ExitReason::Syscon(0)) {
++        if let Some(path) = &batch.pc_histogram_path {
++            use std::io::Write as _;
++            let mut f = BufWriter::new(std::fs::File::create(path)?);
++            let mut entries: Vec<_> = pc_hist.iter().collect();
++            entries.sort();
++            writeln!(f, "pc,count,word")?;
++            for (pc, (count, word)) in entries {
++                writeln!(f, "{pc:#010x},{count},{word:#010x}")?;
++            }
++        }
++        if let Some(path) = &batch.perf_event_path {
++            use std::io::Write as _;
++            let mut f = BufWriter::new(std::fs::File::create(path)?);
++            for (cycle, value) in perf_events.lock().unwrap().iter() {
++                writeln!(f, "{{\"cycle\": {cycle}, \"event\": \"profile\", \"value\": {value}}}")?;
++            }
++        }
++        if let (Some(path), Some(range)) = (&batch.memory_dump_path, &batch.memory_dump_range) {
++            let (start_s, end_s) = range
++                .split_once(':')
++                .ok_or_else(|| anyhow!("--memory-dump-range must be 0xSTART:0xEND"))?;
++            let start = u32::from_str_radix(start_s.trim_start_matches("0x"), 16)?;
++            let end = u32::from_str_radix(end_s.trim_start_matches("0x"), 16)?;
++            ensure!(end >= start, "--memory-dump-range: end < start");
++            let mut buf = vec![0u8; (end - start) as usize];
++            let n = bus.debugger_read(start, &mut buf);
++            ensure!(n == buf.len(), "memory dump range not fully readable");
++            std::fs::write(path, &buf)?;
++        }
++    }
++
+     match reason {
+         ExitReason::Syscon(0) => Ok(ExitCode::SUCCESS),
+         ExitReason::Syscon(code) => {
