@@ -24,6 +24,12 @@ class Profile:
         self.commits = {}
         self.issues = {}
         self.latencies = defaultdict(Counter)
+        self.physical = {}
+        self.physical_latencies = defaultdict(Counter)
+        self.occupancy_cycles = Counter()
+        self.physical_cycle = None
+        self.peak_occupancy = 0
+        self.unmatched_physical_releases = 0
 
     def consume(self, line):
         match = EVENT.match(line)
@@ -32,10 +38,38 @@ class Profile:
         cycle, hart = int(match[1]), int(match[2])
         event = match[3]
         self.events[event] += 1
-        if event not in ("RocketCommit", "T1Issue", "T1Result"):
+        if event not in ("RocketCommit", "T1Issue", "T1Result", "T1Dispatch", "T1PhysicalRelease"):
             return
         fields = {name: int(value, 16 if value.startswith("0x") else 10)
                   for name, value in FIELDS.findall(match[4])}
+        if event in ("T1Dispatch", "T1PhysicalRelease"):
+            if self.physical_cycle is not None:
+                gap = cycle - self.physical_cycle
+                if gap < 0:
+                    raise ValueError("physical events are not in cycle order")
+                self.occupancy_cycles[len(self.physical)] += gap
+            self.physical_cycle = cycle
+            tag = fields["t1_tag"]
+            if event == "T1Dispatch":
+                if tag in self.physical:
+                    raise ValueError(f"physical tag reused before release: {tag}")
+                self.physical[tag] = cycle, fields["inst"], fields["architectural"], hart
+                self.peak_occupancy = max(self.peak_occupancy, len(self.physical))
+            else:
+                dispatched = self.physical.pop(tag, None)
+                if dispatched is None:
+                    self.unmatched_physical_releases += 1
+                else:
+                    started, instruction, architectural, owner = dispatched
+                    if owner != hart:
+                        raise ValueError(f"physical tag released by wrong hart: {tag}")
+                    lifetime = cycle - started
+                    summary = self.physical_latencies[instruction]
+                    summary["count"] += 1
+                    summary["internal_count"] += not architectural
+                    summary["dispatch_to_release_cycles"] += lifetime
+                    summary["maximum_lifetime"] = max(summary["maximum_lifetime"], lifetime)
+            return
         if event == "RocketCommit":
             key = hart, fields["pc"], fields["inst"]
             self.instructions[key]["count"] += 1
@@ -79,6 +113,18 @@ class Profile:
             "unmatched_commits": len(self.commits),
             "instruction_latencies": {hex(instruction): dict(counts)
                                       for instruction, counts in self.latencies.items()},
+            "physical_slot_occupancy": {
+                "observed_cycles": sum(self.occupancy_cycles.values()),
+                "occupied_slot_cycles": sum(slots * cycles for slots, cycles in self.occupancy_cycles.items()),
+                "cycles_at_occupancy": dict(sorted(self.occupancy_cycles.items())),
+                "peak": self.peak_occupancy,
+                "unreleased_tags": len(self.physical),
+                "unmatched_releases": self.unmatched_physical_releases,
+                "scope": "First physical dispatch through last physical release; includes internal layout transfers. "
+                         "Occupancy measures tag lifetimes, not execution-unit busy cycles.",
+            },
+            "physical_instruction_lifetimes": {hex(instruction): dict(counts)
+                                               for instruction, counts in self.physical_latencies.items()},
             "interpretation": "Retirement gaps partition each hart's observed timeline, "
             "not instruction execution costs. Queue and issue-to-result intervals "
             "can overlap across instructions/harts and must not be summed as wall time.",

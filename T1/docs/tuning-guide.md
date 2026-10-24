@@ -320,6 +320,77 @@ Final six-mode package: `/nix/store/z3bg24qgljnx1fd0s303a4arnwqasr8i-mojo-t1-0.1
 `/tmp/vme-final-mMODE-hHARTS-nITERATIONS-{model,rtl}` for modes 0–4 and
 `/tmp/vme-segmented-hHARTS-nITERATIONS-{model,rtl}` for mode 5.
 
+### Physical instruction-slot occupancy
+
+`profile-rtl.py` additionally tracks `T1Dispatch` through
+`T1PhysicalRelease`, including internal layout transfers, and integrates
+physical-tag occupancy between the first dispatch and last release. Tag
+reuse before release, wrong-hart release and out-of-order physical timestamps
+are rejected. Unmatched releases/unreleased tags are reported rather than
+silently counting them as complete lifetimes. Synthetic same-cycle reuse and
+internal-transfer tests, small real-log replay and complete streamed runs
+validate these counters.
+
+The validated `vme32t-threaded` configuration has **four global chaining
+slots**, not four per hart. In `T1ThreadScheduler.scala` at base `643b1e1c`,
+`active` and `free` have `parameter.chainingSize` entries; `free` excludes
+active, reserved and parked tags. Retirement clears an active entry.
+The source in the corrected simulator's validation worktree matches this
+scheduler. No performance RTL change is used for these measurements.
+
+| Four-hart microkernel | Observed cycles | Occupied slot-cycles | Average slots | Cycles with all four occupied |
+| --- | ---: | ---: | ---: | ---: |
+| Resident operands | 20,424 | 79,966 | 3.915 | 19,092 |
+| Eight ordinary loads, no repeated compute | 47,580 | 181,560 | 3.816 | 39,152 |
+| Segmented loads, agnostic tails | 43,291 | 169,394 | 3.913 | 39,919 |
+| Segmented loads, undisturbed tails | 28,505 | 109,251 | 3.833 | 24,641 |
+
+These runs have no unmatched releases or unreleased tags and peak occupancy
+exactly four. Ordinary loads have approximately 21-cycle issue-to-result
+latency and 22-cycle dispatch-to-release lifetime even for the 4-byte loads.
+Eight such loads consume about 176 slot-cycles; four slots alone require at
+least 44 elapsed cycles at those lifetimes, close to the measured 46-cycle
+steady-state iteration. Adding harts does not add slots. This is evidence
+for a shared in-flight-instruction/latency constraint, not an assertion that
+DRAM bandwidth is saturated.
+
+The final optimized Stories15M layer observes 751,864 physical-window cycles
+and 2,694,862 occupied slot-cycles: average occupancy **3.584/4 (89.6%)**,
+with all four occupied for **546,907 cycles (72.7%)**. No tags are active for
+only 10,074 cycles (1.34%). The old byte-wise output clearing is gone: scalar
+byte stores fall from 47,616 to zero. Major instruction lifetimes are:
+
+| Instruction | Physical dispatch count | Mean dispatch-to-release cycles |
+| --- | ---: | ---: |
+| `vlseg4e8.v` | 18,432 | 28.27 |
+| `vtmmu` | 9,216 | 45.81 |
+| `vle32.v` | 13,183 | 24.85 |
+| `vtse32` | 4,608 | 46.82 |
+| `vse32.v` | 5,008 | 28.98 |
+| `vfadd.vv` | 4,988 | 28.88 |
+
+The remaining RTL constraint is therefore shared slot capacity combined with
+long load, tile-transfer and vector-operation lifetimes, not just activation
+quantization or scalar feeding. The tile scheduler also permits only one
+tile access in flight per hart, while VME tile storage uses protected SRAM
+read-modify-write operations. Neither arithmetic width nor memory bus width
+alone predicts this workload's throughput.
+
+Occupancy is **not** functional-unit utilization. These lifetimes include
+waiting and retirement; do not add them as elapsed time. The occupancy-derived
+lower bound assumes the measured lifetimes and does not predict a speedup
+from increasing `chainingSize`: more slots could expose other shared-resource
+limits or increase lifetimes. Larger/separate issue-credit pools and shorter
+load/tile-transfer lifetimes are RTL A/B candidates, not validated RTL fixes.
+No new functional RTL bug was found in these runs.
+
+Profiles: `/tmp/vme-final-m0-h4-n256-slots`,
+`/tmp/vme-final-m4-h4-n256-slots`, `/tmp/vme-segmented-h4-n256-slots`,
+`/tmp/vme-tail-m6-h4-n256-slots`, and `/tmp/segmented-tu-stories-rtl`.
+Each complete dump matches its ISA reference. The final layer's counters
+include internal layout-transfer dispatches; physical occupancy does not
+include any extra time a parked logical reservation survives between dispatches.
+
 ### Confirmed scalar-to-vector correctness failure
 
 The four-hart synthetic single-token layer differs between the previously
