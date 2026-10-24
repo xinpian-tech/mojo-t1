@@ -307,7 +307,10 @@ The segmented-load experiment passes all nine ISA/RTL combinations too.
 Its slopes are 104.0, 52.0 and 41.75 cycles/iteration for 1/2/4 harts. At four
 harts this improves over ordinary loads by 28.0% (58.0 to 41.75); at one hart
 it is slightly worse. All five preceding modes were rerun from the same
-final package and retain the table's slopes. This is a microkernel gain,
+final package. Modes 0/1/3/4 retain the table's slopes; four-hart ping-pong
+changes from 58.5 to 57.75 cycles with the extra packed buffers/code layout,
+still within 0.5% of fixed-register reload rather than closing the feeding
+gap. This is a microkernel gain,
 not yet a measured Llama-layer gain. It justifies testing the changed
 packing in the actual prefill software rather than declaring the LSU limit
 unavoidable.
