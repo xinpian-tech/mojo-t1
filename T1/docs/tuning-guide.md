@@ -250,6 +250,73 @@ against the ISA reference. Metadata reuse does not eliminate the remaining
 73,728 operand-load instructions or per-group tile-result traffic. Reducing
 those costs is separate work, not an additional speedup claimed here.
 
+### Controlled VME feeding-throughput experiments
+
+`t1-vme-throughput MODE HARTS ITERATIONS` isolates a fixed M=4, N=32, K=4
+integer matrix operation (512 MACs) on 1, 2 or 4 active harts of the same
+four-hart RTL. It checks every active output and untouched inactive outputs
+against exact integer arithmetic. Resident mode preloads operands once;
+reload modes repeatedly read the same small buffers. These experiments
+measure the local instruction/VRF/LSU/VME path, not DRAM streaming bandwidth.
+
+The 64-to-256-iteration cycle difference removes fixed launch/initialization/
+readback cost. Divide by `192 * active_harts` for aggregate cycles per
+iteration. Modes 0–3 perform a `vtmmu` each iteration; mode 4 intentionally
+does only eight vector loads and configuration, after one initialization MAC.
+
+| Mode | 1 hart | 2 harts | 4 harts |
+| --- | ---: | ---: | ---: |
+| 0: resident operands | 44.0 | 22.0 | 19.333 |
+| 1: reload fixed registers | 101.0 | 68.5 | 58.0 |
+| 2: reload alternating register banks | 90.0 | 61.0 | 58.5 |
+| 3: resident operands plus two `msettn` per iteration | 44.0 | 22.0 | 19.333 |
+| 4: loads/configuration only, no repeated matrix compute | 46.0 | 46.0 | 46.0 |
+
+All 45 combinations (five modes, three hart counts, iteration counts 1/64/256)
+pass RTL and full ISA dump comparison. Measured package:
+`/nix/store/7g1mvasrwy538761ypyypik9bfja84m8-mojo-t1-0.1.0`, built with
+`nix build .#t1 -o /tmp/mojo-t1-throughput-controls`. Artifacts use
+`/tmp/vme-controls-mMODE-hHARTS-nITERATIONS-{model,rtl}`.
+
+This distinguishes several effects rather than assigning all waiting to
+matrix arithmetic:
+
+- The resident four-hart path sustains 26.48 MAC/cycle without repeated LSU
+  loads or software quantization/epilogues. VME still reads the VRF and updates
+  tile storage; this is not isolated ALU peak throughput.
+- Repeating `msettn` alone does not change the throughput slope. Configuration
+  count is not the dominant steady-state cost in this controlled loop.
+- The eight-load pattern (four 4-byte and four 32-byte loads) has a fixed
+  aggregate 46-cycle cost even as active harts increase. Its effective payload
+  rate is 144/46 = 3.13 bytes/cycle, not a measured external bus limit.
+- Register ping-pong helps at one and two harts, but not at four. Therefore
+  eliminating same-register WAR reuse alone cannot fix the four-hart feeding
+  bottleneck. Fixed-register reload+compute takes three times the resident
+  cycles per operation; only part of load and compute time overlaps.
+
+These measurements establish a shared feeding-throughput limit for this
+access pattern. They do not prove that the software has reached its optimum:
+changing weight/activation packing and load granularity remains relevant.
+Mode 5 tests four-field segmented loads under RVV LMUL=2, followed by
+restoring matrix configuration (which derives LMUL=1) before `vtmmu`.
+This order preserves the desired two-register spacing without expecting
+`msetmtype` to preserve LMUL=2. Its benefit must be measured before adopting
+the different packed layout in Llama.
+
+The segmented-load experiment passes all nine ISA/RTL combinations too.
+Its slopes are 104.0, 52.0 and 41.75 cycles/iteration for 1/2/4 harts. At four
+harts this improves over ordinary loads by 28.0% (58.0 to 41.75); at one hart
+it is slightly worse. All five preceding modes were rerun from the same
+final package and retain the table's slopes. This is a microkernel gain,
+not yet a measured Llama-layer gain. It justifies testing the changed
+packing in the actual prefill software rather than declaring the LSU limit
+unavoidable.
+
+Final six-mode package: `/nix/store/z3bg24qgljnx1fd0s303a4arnwqasr8i-mojo-t1-0.1.0`
+(`nix build .#t1 -o /tmp/mojo-t1-throughput-segmented`). Validated runs are
+`/tmp/vme-final-mMODE-hHARTS-nITERATIONS-{model,rtl}` for modes 0–4 and
+`/tmp/vme-segmented-hHARTS-nITERATIONS-{model,rtl}` for mode 5.
+
 ### Confirmed scalar-to-vector correctness failure
 
 The four-hart synthetic single-token layer differs between the previously

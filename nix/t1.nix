@@ -59,6 +59,8 @@ stdenvNoCC.mkDerivation {
     install -m755 t1-vme-gemm "$out/bin/t1-vme-gemm"
     "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_GEMM_ROWS=1 "$out/share/t1/examples/vme_gemm.mojo" -o t1-vme-gemm-serial
     install -m755 t1-vme-gemm-serial "$out/bin/t1-vme-gemm-serial"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/vme_throughput.mojo" -o t1-vme-throughput
+    install -m755 t1-vme-throughput "$out/bin/t1-vme-throughput"
     "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/vme_gemm_quantized.mojo" -o t1-vme-gemm-quantized
     install -m755 t1-vme-gemm-quantized "$out/bin/t1-vme-gemm-quantized"
     "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_PREFILL_GEMM=0 "$out/share/t1/examples/vme_gemm_quantized.mojo" -o t1-vme-gemm-quantized-serial
