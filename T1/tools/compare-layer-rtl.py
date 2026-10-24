@@ -1,4 +1,4 @@
-"""Compare completed RVV/VME layer runs after checking their ISA readbacks."""
+"""Compare completed layer runs after checking their ISA readbacks."""
 
 import argparse
 import hashlib
@@ -40,23 +40,35 @@ def inspect(work: Path, reference: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rvv", required=True, type=Path)
-    parser.add_argument("--vme", required=True, type=Path)
-    parser.add_argument("--rvv-reference", required=True, type=Path)
-    parser.add_argument("--vme-reference", required=True, type=Path)
+    parser.add_argument("--rvv", "--baseline", required=True, type=Path)
+    parser.add_argument("--vme", "--candidate", required=True, type=Path)
+    parser.add_argument("--rvv-reference", "--baseline-reference", required=True, type=Path)
+    parser.add_argument("--vme-reference", "--candidate-reference", required=True, type=Path)
+    parser.add_argument("--require-identical-readback", action="store_true",
+                        help="also require byte-identical baseline/candidate memory dumps")
+    parser.add_argument("--prefill", action="store_true",
+                        help="label the paths serial/GEMM rather than RVV/VME")
     arguments = parser.parse_args()
     rvv = inspect(arguments.rvv, arguments.rvv_reference)
     vme = inspect(arguments.vme, arguments.vme_reference)
     if rvv["configuration"] != vme["configuration"]:
         raise ValueError("RTL configurations differ")
+    if arguments.require_identical_readback:
+        if ((arguments.rvv / "memdump.bin").read_bytes()
+                != (arguments.vme / "memdump.bin").read_bytes()):
+            raise ValueError("baseline and candidate readbacks differ")
+    baseline_label = "serial" if arguments.prefill else "rvv"
+    candidate_label = "gemm" if arguments.prefill else "vme"
     print(json.dumps({
-        "rvv": rvv,
-        "vme": vme,
-        "vme_over_rvv_kernel_cycles": vme["kernel_cycles"] / rvv["kernel_cycles"],
-        "speedup_rvv_over_vme": rvv["kernel_cycles"] / vme["kernel_cycles"],
+        baseline_label: rvv,
+        candidate_label: vme,
+        f"{candidate_label}_over_{baseline_label}_kernel_cycles": vme["kernel_cycles"] / rvv["kernel_cycles"],
+        f"speedup_{baseline_label}_over_{candidate_label}": rvv["kernel_cycles"] / vme["kernel_cycles"],
+        "cross_readback_checked": arguments.require_identical_readback,
         "scope": "Kernel interval only; caller must ensure identical model, "
-                 "layer, position, input and simulator build. Each path is "
-                 "checked against its own ISA reference, not against the other path.",
+                 "layer, position, token count, input and simulator build. Each path is "
+                 "checked against its own ISA reference; cross-path equality is "
+                 "checked only when cross_readback_checked is true.",
     }, indent=2))
 
 

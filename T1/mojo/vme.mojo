@@ -4,6 +4,110 @@ from std.sys import inlined_assembly
 
 
 @always_inline
+def matrix_u8_i8[
+    output_origin: MutOrigin, weight_origin: MutOrigin, input_origin: MutOrigin, //
+](
+    output: Pointer[Int32, output_origin],
+    weights: Pointer[Int8, weight_origin],
+    inputs: Pointer[UInt8, input_origin],
+    reduction: Int,
+    rows: Int,
+    columns: Int,
+    weight_stride: Int,
+    input_stride: Int,
+    output_stride: Int,
+):
+    """Computes C[M,N] = A[K,M].T @ B[K,N] in tile 4.
+
+    Rows and columns must be in 1..32, and reduction a positive multiple
+    of four. Input and weight strides are bytes between successive K rows;
+    output_stride counts Int32 elements between output rows. Output must
+    be naturally aligned. Only the requested rectangle is accessed.
+    """
+    matrix_submit(weights, inputs, reduction, rows, columns, weight_stride, input_stride)
+    matrix_finish(output, rows, columns, output_stride)
+
+
+@always_inline
+def matrix_submit[weight_origin: MutOrigin, input_origin: MutOrigin, //](
+    weights: Pointer[Int8, weight_origin], inputs: Pointer[UInt8, input_origin],
+    reduction: Int, rows: Int, columns: Int, weight_stride: Int, input_stride: Int,
+):
+    """Submits tile 4; finish it before another tile-4 computation.
+
+    Uses the same shape/layout contract as matrix_u8_i8. Independent RVV
+    work may follow, but must not overwrite v8/v10/v12/v14/v16/v18/v20/v22.
+    """
+    inlined_assembly[
+        "mv t2, $0\n"
+        "mv t3, $1\n"
+        "mv t4, $2\n"
+        "mv t5, $5\n"
+        "mv t6, $6\n"
+        "slli t0, $3, 10\n"
+        "ori t0, t0, 131\n"
+        "li t1, 256\n"
+        ".word 0x8462f057\n"
+        "mv t0, $4\n"
+        ".word 0x8802f057\n"
+        ".word 0x43e06457\n"
+        "1:\n"
+        "mv t0, $3\n"
+        ".word 0x8802f057\n"
+        "vle8.v v8, (t3)\n"
+        "add t3, t3, t6\n"
+        "vle8.v v10, (t3)\n"
+        "add t3, t3, t6\n"
+        "vle8.v v12, (t3)\n"
+        "add t3, t3, t6\n"
+        "vle8.v v14, (t3)\n"
+        "add t3, t3, t6\n"
+        "mv t0, $4\n"
+        ".word 0x8802f057\n"
+        "vle8.v v16, (t2)\n"
+        "add t2, t2, t5\n"
+        "vle8.v v18, (t2)\n"
+        "add t2, t2, t5\n"
+        "vle8.v v20, (t2)\n"
+        "add t2, t2, t5\n"
+        "vle8.v v22, (t2)\n"
+        "add t2, t2, t5\n"
+        ".word 0xf2880477\n"
+        "addi t4, t4, -4\n"
+        "bnez t4, 1b\n",
+        NoneType,
+        constraints="r,r,r,r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{t6},"
+        "~{v8},~{v10},~{v12},~{v14},~{v16},~{v18},~{v20},~{v22},~{memory}",
+    ](weights, inputs, reduction, rows, columns, weight_stride, input_stride)
+
+
+@always_inline
+def matrix_finish[output_origin: MutOrigin, //](
+    output: Pointer[Int32, output_origin], rows: Int, columns: Int, output_stride: Int,
+):
+    """Restores matrix configuration and stores each submitted output row.
+
+    The final fence orders all result stores before subsequent memory work.
+    Rows, columns and element stride follow matrix_u8_i8's contract.
+    """
+    for row in range(rows):
+        inlined_assembly[
+            "li t0, 1155\n"
+            "li t1, 256\n"
+            ".word 0x8462f057\n"
+            "mv t0, $1\n"
+            ".word 0x8802f057\n"
+            "mv a0, $0\n"
+            "li a1, 0x20000000\n"
+            "or a1, a1, $2\n"
+            ".word 0x52b57027\n",
+            NoneType,
+            constraints="r,r,r,~{t0},~{t1},~{a0},~{a1},~{memory}",
+        ](output.unsafe_offset(row * output_stride), columns, row)
+    inlined_assembly["fence iorw, iorw", NoneType, constraints="~{memory}"]()
+
+
+@always_inline
 def matvec_u8_i8[
     output_origin: MutOrigin, weight_origin: MutOrigin, input_origin: MutOrigin, //
 ](
@@ -17,6 +121,7 @@ def matvec_u8_i8[
     """Computes up to 32 outputs using VME u8 × i8 → i32 accumulation.
 
     Weights are reduction-major with `weight_stride` bytes per column.
+    Inputs must be four-byte aligned.
     The reduction length must be a positive multiple of four; the caller
     supplies one to 32 outputs. Each hart owns its tile-4 accumulator.
     """
@@ -53,14 +158,7 @@ def matvec_submit[
         ".word 0x8802f057\n"
         ".word 0x43e06457\n"
         "1:\n"
-        "lbu t0, 0(t3)\n"
-        "vmv.v.x v8, t0\n"
-        "lbu t0, 1(t3)\n"
-        "vmv.v.x v10, t0\n"
-        "lbu t0, 2(t3)\n"
-        "vmv.v.x v12, t0\n"
-        "lbu t0, 3(t3)\n"
-        "vmv.v.x v14, t0\n"
+        "lw t0, 0(t3)\n"
         "vle8.v v16, (t2)\n"
         "add t2, t2, t5\n"
         "vle8.v v18, (t2)\n"
@@ -69,6 +167,13 @@ def matvec_submit[
         "add t2, t2, t5\n"
         "vle8.v v22, (t2)\n"
         "add t2, t2, t5\n"
+        "vmv.v.x v8, t0\n"
+        "srli t0, t0, 8\n"
+        "vmv.v.x v10, t0\n"
+        "srli t0, t0, 8\n"
+        "vmv.v.x v12, t0\n"
+        "srli t0, t0, 8\n"
+        "vmv.v.x v14, t0\n"
         ".word 0xf2880477\n"
         "addi t3, t3, 4\n"
         "addi t4, t4, -4\n"

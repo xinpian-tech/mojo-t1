@@ -103,11 +103,23 @@ def main() -> None:
     ], "reference", output, environment, arguments.timeout)
     single_tokens = tokens(single)
     threaded_tokens = tokens(threaded)
-    if len(single_tokens) != arguments.steps or single_tokens != threaded_tokens:
-        raise AssertionError("incomplete inference or different single/four-hart tokens")
     prompt_count = re.search(r"prompt tokens: (\d+)", threaded)
     if not prompt_count or arguments.steps < int(prompt_count[1]):
         raise AssertionError("run did not reach a generated token beyond the prompt")
+    batch_match = re.search(r"prefill batch: (\d+)", threaded)
+    batch_size = int(batch_match[1]) if batch_match else 1
+    if batch_size < 1:
+        raise AssertionError("invalid prefill batch size")
+    expected_positions = []
+    position = 0
+    while position < arguments.steps:
+        count = min(batch_size, arguments.steps - position,
+                    max(1, int(prompt_count[1]) - position))
+        position += count
+        expected_positions.append(position - 1)
+    if ([position for position, _ in threaded_tokens] != expected_positions
+            or single_tokens != threaded_tokens):
+        raise AssertionError("incomplete inference or different single/four-hart tokens")
     if transcript(single) != transcript(threaded) or transcript(threaded) != reference.rstrip("\n"):
         raise AssertionError("inference transcript differs from the C reference")
     report = {

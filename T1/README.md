@@ -178,7 +178,57 @@ final output newline). This remains separate from RTL acceptance.
 
 ## RTL acceptance
 
-### First-layer VME performance evaluation
+### Four-token prefill GEMM evaluation
+
+Prefill now groups up to four known prompt tokens in one layer launch,
+reusing each weight tile across those rows. Single-token decode remains
+GEMV. The group-32 quantization and per-token activation scales are unchanged.
+See [the tuning guide](docs/tuning-guide.md) for the pinned Zvt semantics,
+microarchitecture constraints, bandwidth accounting and optional interleaving.
+
+Stories15M layer 0, positions 0–3, prompt `The capital of France is`, four
+harts, VLEN 1024, DLEN 256, TE 32, trivial simulator memory model:
+
+| Path | Kernel cycles | Total simulator cycles |
+| --- | ---: | ---: |
+| Four GEMVs, batched layer scheduling | 3,349,034 | 3,349,344 |
+| M=4 GEMM, blocking epilogue | 1,901,030 | 1,901,340 |
+
+This is **1.762x faster**, or 43.2% fewer kernel cycles, for the same
+quantized workload. Both complete 41,195,968-byte memory dumps match their
+own ISA runs and each other (SHA-256
+`454c655d8590e012217517f27811ebca88f29ac99bdaa2d83a5cb3d70ed462c6`).
+Only one layer runs; host packing and simulator startup are excluded.
+These measurements use package
+`/nix/store/irhlq0l6wrr1i34xkg7kjh89w56dl930-mojo-t1-0.1.0`
+and the corrected simulator including the scalar/vector RAW repair
+`/nix/store/ndymhs8n3yknii1c0fh6pqkpigmzjk2i-t1-vme32t-threaded-t1rocketemu-verilated-simulator`.
+
+The scalar-FP-to-vector RAW repair is
+[T1 PR #211](https://github.com/xinpian-tech/T1/pull/211). These measurements
+and the original failing-layer replay use fix commit `90641f92` plus the
+existing independent simulator corrections. Later changes to the PR branch
+are not implicitly covered by this pinned validation. The standalone
+`t1-scalar-vector-hazard`, all four synthetic prefill token counts, and the
+integer/quantized GEMM tests pass on this simulator. See the tuning guide
+for the failing-before/passing-after evidence.
+
+Run `t1llama` and `t1llama-prefill-serial` with the same model, tokenizer,
+prompt and `12 --first-layer-only`; preserve each run's directory and compare:
+
+```sh
+python3 T1/tools/compare-layer-rtl.py --prefill --require-identical-readback \
+  --baseline /path/to/serial-rtl --candidate /path/to/gemm-rtl \
+  --baseline-reference /path/to/serial-isa/memdump.bin \
+  --candidate-reference /path/to/gemm-isa/memdump.bin
+```
+
+`t1-prefill --tokens N` checks a synthetic layer with 1–4 tokens, a nonzero
+starting position, grouped-query attention and full residual/KV comparison
+against sequential execution. This is a layer-correctness test, not a
+full-model acceptance claim.
+
+### Historical single-token VME performance evaluation
 
 The TinyLlama 1.1B first transformer layer at position 0 completes on the
 corrected four-hart RTL (VLEN 1024, DLEN 256, TE 32), using the same input
@@ -191,7 +241,7 @@ and simulator for both paths:
 
 Both complete memory readbacks match their respective four-hart ISA-model
 reference runs byte for byte, including all 2048 layer-output floats.
-The current VME path takes **3.181 times as many kernel cycles** (0.314x
+That single-token VME implementation takes **3.181 times as many kernel cycles** (0.314x
 speedup), so the observed cross-hart overlap does not yield a net speedup.
 These are kernel-entry-to-return MMIO cycle measurements, not host runtime;
 they include device activation quantization, computation and synchronization,

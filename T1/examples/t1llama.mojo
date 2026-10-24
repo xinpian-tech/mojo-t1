@@ -30,7 +30,7 @@
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_dim
 from max.gpu.sync import barrier
-from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled
+from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, matrix_submit, matrix_finish
 from std.memory import unsafe_stack_allocation
 from std.collections import Dict
 from std.io.file import FileHandle
@@ -74,6 +74,9 @@ comptime SEW = 32
 comptime VLEN = get_defined_int["T1_VLEN", 1024]()
 comptime THREADS = get_defined_int["T1_THREADS", 4]()
 comptime USE_VME = get_defined_int["T1_VME", 1]() != 0
+comptime PREFILL_GEMM = get_defined_int["T1_PREFILL_GEMM", 1]() != 0
+comptime PREFILL_INTERLEAVE = get_defined_int["T1_PREFILL_INTERLEAVE", 0]() != 0
+comptime PREFILL_BATCH = get_defined_int["T1_PREFILL_BATCH", 4]()
 comptime MV_LMUL = get_defined_int["T1_MV_LMUL", 2]()
 comptime MV_TRANSPOSED = get_defined_int["T1_MV_T", 1]() != 0
 # Columns per scalar-prefetch batch in the transposed matvec (<= 8).
@@ -404,7 +407,7 @@ def _mv1(w: F32Ptr, x: F32Ptr, n: Int, out_ptr: F32Ptr):
 @always_inline
 def _matvec_vme(out_ptr: F32Ptr, weights: F32Ptr, inputs: F32Ptr, outputs: Int, reduction: Int):
     """Runs group-32 quantized matrix multiplication on each hart's VME tile."""
-    var quantized = unsafe_stack_allocation[32, DType.uint8]()
+    var quantized = unsafe_stack_allocation[8, DType.uint32]().bitcast[UInt8]()
     var accumulator = unsafe_stack_allocation[64, DType.int32]()
     var packed = weights.bitcast[Int8]()
     var scales = weights.unsafe_offset(outputs * reduction // 4)
@@ -449,6 +452,83 @@ def _matvec_vme(out_ptr: F32Ptr, weights: F32Ptr, inputs: F32Ptr, outputs: Int, 
                 out_ptr.unsafe_offset(previous), accumulator.unsafe_offset((1 - slot) * 32),
                 sums.unsafe_offset(metadata), scales.unsafe_offset(metadata), scale, previous_count,
             )
+
+
+@always_inline
+def _matmul(
+    out_ptr: F32Ptr, weights: F32Ptr, inputs: F32Ptr,
+    rows: Int, outputs: Int, reduction: Int, input_stride: Int, output_stride: Int,
+):
+    """Projects independent token rows, sharing group-32 weights within each tile."""
+    comptime if not USE_VME or not PREFILL_GEMM:
+        for row in range(rows):
+            _matvec(
+                out_ptr.unsafe_offset(row * output_stride), weights,
+                inputs.unsafe_offset(row * input_stride), outputs, reduction,
+            )
+    else:
+        var quantized = unsafe_stack_allocation[32, DType.uint32]().bitcast[UInt8]()
+        var activation_scales = unsafe_stack_allocation[4, DType.float32]()
+        var accumulator = unsafe_stack_allocation[256, DType.int32]()
+        var packed = weights.bitcast[Int8]()
+        var scales = weights.unsafe_offset(outputs * reduction // 4)
+        var sums = scales.unsafe_offset(outputs * reduction // 32).bitcast[Int32]()
+        var first = outputs * thread_idx.x // block_dim.x
+        var last = outputs * (thread_idx.x + 1) // block_dim.x
+        for row_base in range(0, rows, 4):
+            var row_count = min(4, rows - row_base)
+            for row in range(row_count):
+                for column in range(first, last):
+                    out_ptr[(row_base + row) * output_stride + column] = 0
+            for group in range(reduction // 32):
+                for row in range(row_count):
+                    var source = inputs.unsafe_offset((row_base + row) * input_stride + group * 32)
+                    var magnitude = Float32(0)
+                    for inner in range(32):
+                        magnitude = max(magnitude, abs(source[inner]))
+                    var scale = magnitude / 127 if magnitude > 0 else Float32(1)
+                    activation_scales[row] = scale
+                    for inner in range(32):
+                        var value = source[inner] / scale
+                        var rounded = Int(value + (Float32(0.5) if value >= 0 else Float32(-0.5)))
+                        quantized[inner * 4 + row] = UInt8(max(-127, min(127, rounded)) + 128)
+                var previous = first
+                var previous_count = 0
+                var slot = 0
+                for column in range(first, last, 32):
+                    var count = min(32, last - column)
+                    matrix_submit(
+                        packed.unsafe_offset(group * 32 * outputs + column),
+                        quantized, 32, row_count, count, outputs, 4,
+                    )
+                    comptime if not PREFILL_INTERLEAVE:
+                        matrix_finish(accumulator, row_count, count, 32)
+                    var result_column = previous if PREFILL_INTERLEAVE else column
+                    var result_count = previous_count if PREFILL_INTERLEAVE else count
+                    var result_slot = (1 - slot) * 128 if PREFILL_INTERLEAVE else 0
+                    var metadata = group * outputs + result_column
+                    if result_count:
+                        for row in range(row_count):
+                            accumulate_scaled(
+                                out_ptr.unsafe_offset((row_base + row) * output_stride + result_column),
+                                accumulator.unsafe_offset(result_slot + row * 32), sums.unsafe_offset(metadata),
+                                scales.unsafe_offset(metadata), activation_scales[row], result_count,
+                            )
+                    comptime if PREFILL_INTERLEAVE:
+                        matrix_finish(accumulator.unsafe_offset(slot * 128), row_count, count, 32)
+                        previous = column
+                        previous_count = count
+                        slot = 1 - slot
+                comptime if PREFILL_INTERLEAVE:
+                    var metadata = group * outputs + previous
+                    for row in range(row_count):
+                        if previous_count:
+                            accumulate_scaled(
+                                out_ptr.unsafe_offset((row_base + row) * output_stride + previous),
+                                accumulator.unsafe_offset((1 - slot) * 128 + row * 32), sums.unsafe_offset(metadata),
+                                scales.unsafe_offset(metadata), activation_scales[row], previous_count,
+                            )
+        barrier()
 
 
 @always_inline
@@ -711,7 +791,7 @@ def _rope_head(q: F32Ptr, rope: F32Ptr, hs: Int):
         offset += count
 
 
-def t1_layer(hdr: I32Ptr, rope: F32Ptr, x: F32Ptr, w: F32Ptr, kv: F32Ptr, sc: F32Ptr):
+def t1_layer[stop_before_activation: Bool = False](hdr: I32Ptr, rope: F32Ptr, x: F32Ptr, w: F32Ptr, kv: F32Ptr, sc: F32Ptr):
     """One transformer layer for one token position.
 
     hdr:  [pos, dim, hidden, n_heads, n_kv_heads, head_size, seq_cap, vocab]
@@ -823,6 +903,8 @@ def t1_layer(hdr: I32Ptr, rope: F32Ptr, x: F32Ptr, w: F32Ptr, kv: F32Ptr, sc: F3
     _rmsnorm(xb, x, w.unsafe_offset(o_rms_ffn), dim)
     _matvec(hb, w.unsafe_offset(o_w1), xb, hidden, dim)
     _matvec(hb2, w.unsafe_offset(o_w3), xb, hidden, dim)
+    if stop_before_activation:
+        return
     var j = hidden * thread_idx.x // block_dim.x
     var end = hidden * (thread_idx.x + 1) // block_dim.x
     while j + W <= end:
@@ -840,12 +922,116 @@ def t1_layer(hdr: I32Ptr, rope: F32Ptr, x: F32Ptr, w: F32Ptr, kv: F32Ptr, sc: F3
     _vadd(x, xb, dim)
 
 
+def t1_prefill_layer(
+    hdr: I32Ptr, rope: F32Ptr, x: F32Ptr, w: F32Ptr, kv: F32Ptr, sc: F32Ptr, token_count: Int32,
+):
+    """Processes known consecutive tokens with causal attention and shared weights.
+
+    The header position is the first token position. Residual and RoPE rows
+    are contiguous. Scratch holds xb[rows,dim], q[rows,dim], hb[rows,hidden],
+    hb2[rows,hidden], and att[THREADS,seq_cap]. KV uses the decode layout.
+    """
+    comptime W = simd_width_of[DType.float32]()
+    var rows = Int(token_count)
+    var start = Int(hdr[0])
+    var dim = Int(hdr[1])
+    var hidden = Int(hdr[2])
+    var n_heads = Int(hdr[3])
+    var n_kv = Int(hdr[4])
+    var hs = Int(hdr[5])
+    var seq_cap = Int(hdr[6])
+    var kv_dim = n_kv * hs
+    var kv_mul = n_heads // n_kv
+    var o_wq = dim
+    var o_wk = o_wq + dim * dim
+    var o_wv = o_wk + kv_dim * dim
+    var o_wo = o_wv + kv_dim * dim
+    var o_rms_ffn = o_wo + dim * dim
+    var o_w1 = o_rms_ffn + dim
+    var o_w2 = o_w1 + hidden * dim
+    var o_w3 = o_w2 + dim * hidden
+    var xb = sc
+    var query = sc.unsafe_offset(rows * dim)
+    var gate = sc.unsafe_offset(2 * rows * dim)
+    var up = sc.unsafe_offset(2 * rows * dim + rows * hidden)
+    var att = sc.unsafe_offset(2 * rows * (dim + hidden) + thread_idx.x * seq_cap)
+    var value_cache = kv.unsafe_offset(seq_cap * kv_dim)
+    for row in range(rows):
+        _rmsnorm(xb.unsafe_offset(row * dim), x.unsafe_offset(row * dim), w, dim)
+    _matmul(query, w.unsafe_offset(o_wq), xb, rows, dim, dim, dim, dim)
+    _matmul(kv.unsafe_offset(start * kv_dim), w.unsafe_offset(o_wk), xb, rows, kv_dim, dim, dim, kv_dim)
+    _matmul(value_cache.unsafe_offset(start * kv_dim), w.unsafe_offset(o_wv), xb, rows, kv_dim, dim, dim, kv_dim)
+    for row in range(rows):
+        for head in range(thread_idx.x, n_heads, block_dim.x):
+            _rope_head(query.unsafe_offset(row * dim + head * hs), rope.unsafe_offset(row * hs), hs)
+        for head in range(thread_idx.x, n_kv, block_dim.x):
+            _rope_head(kv.unsafe_offset((start + row) * kv_dim + head * hs), rope.unsafe_offset(row * hs), hs)
+    barrier()
+    var scale = Float32(1) / sqrt(Float32(hs))
+    for row in range(rows):
+        var position = start + row
+        for head in range(thread_idx.x, n_heads, block_dim.x):
+            var query_offset = row * dim + head * hs
+            var kv_offset = (head // kv_mul) * hs
+            for previous in range(position + 1):
+                att[previous] = _dot(
+                    query.unsafe_offset(query_offset), kv.unsafe_offset(previous * kv_dim + kv_offset), hs,
+                ) * scale
+            var maximum = att[0]
+            for previous in range(1, position + 1):
+                if att[previous] > maximum:
+                    maximum = att[previous]
+            var total = Float32(0)
+            for previous in range(position + 1):
+                var exponential = exp(att[previous] - maximum)
+                att[previous] = exponential
+                total += exponential
+            var inverse = Float32(1) / total
+            _axpy_first(xb.unsafe_offset(query_offset), value_cache.unsafe_offset(kv_offset), att[0] * inverse, hs)
+            for previous in range(1, position + 1):
+                _axpy(
+                    xb.unsafe_offset(query_offset), value_cache.unsafe_offset(previous * kv_dim + kv_offset),
+                    att[previous] * inverse, hs,
+                )
+    barrier()
+    _matmul(query, w.unsafe_offset(o_wo), xb, rows, dim, dim, dim, dim)
+    for row in range(rows):
+        _vadd(x.unsafe_offset(row * dim), query.unsafe_offset(row * dim), dim)
+        _rmsnorm(xb.unsafe_offset(row * dim), x.unsafe_offset(row * dim), w.unsafe_offset(o_rms_ffn), dim)
+    _matmul(gate, w.unsafe_offset(o_w1), xb, rows, hidden, dim, dim, hidden)
+    _matmul(up, w.unsafe_offset(o_w3), xb, rows, hidden, dim, dim, hidden)
+    for row in range(rows):
+        var element = hidden * thread_idx.x // block_dim.x
+        var last = hidden * (thread_idx.x + 1) // block_dim.x
+        while element + W <= last:
+            var offset = row * hidden + element
+            var value = gate.unsafe_load[width=W](offset)
+            var multiplier = up.unsafe_load[width=W](offset)
+            var sigmoid = value / (SIMD[DType.float32, W](1) + exp(-value))
+            gate.unsafe_store(offset, sigmoid * multiplier)
+            element += W
+        while element < last:
+            var offset = row * hidden + element
+            var value = gate[offset]
+            gate[offset] = value / (Float32(1) + exp(-value)) * up[offset]
+            element += 1
+    barrier()
+    _matmul(xb, w.unsafe_offset(o_w2), gate, rows, dim, hidden, hidden, dim)
+    for row in range(rows):
+        _vadd(x.unsafe_offset(row * dim), xb.unsafe_offset(row * dim), dim)
+
+
 def t1_head(hdr: I32Ptr, x: F32Ptr, w: F32Ptr, logits: F32Ptr, sc: F32Ptr):
     """Final RMSNorm + classifier matvec. w = rms_final[dim], wcls[vocab*dim]."""
     var dim = Int(hdr.unsafe_load(1))
     var vocab = Int(hdr.unsafe_load(7))
     _rmsnorm(sc, x, w, dim)
     _matvec(logits, w.unsafe_offset(dim), sc, vocab, dim)
+
+
+def t1_prefill_head(hdr: I32Ptr, x: F32Ptr, w: F32Ptr, logits: F32Ptr, sc: F32Ptr, rows: Int32):
+    """Classifies only the final known token in a prefill batch."""
+    t1_head(hdr, x.unsafe_offset((Int(rows) - 1) * Int(hdr[1])), w, logits, sc)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1057,12 +1243,15 @@ struct Tokenizer:
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        print("usage: t1llama <model.bin> <tokenizer.bin> [prompt] [steps]")
+        print("usage: t1llama <model.bin> <tokenizer.bin> [prompt] [steps] [--first-layer-only]")
         return
     var model_path = String(args[1])
     var tok_path = String(args[2])
     var prompt = String(args[3]) if len(args) > 3 else String("")
     var steps = Int(String(args[4])) if len(args) > 4 else 64
+    var first_layer_only = len(args) > 5 and String(args[5]) == "--first-layer-only"
+    if PREFILL_BATCH < 1 or PREFILL_BATCH > 4:
+        raise Error("T1_PREFILL_BATCH must be in 1..4")
 
     # --- Model header -----------------------------------------------------
     var f = open(model_path, "r")
@@ -1118,7 +1307,7 @@ def main() raises:
         + cfg.dim * cfg.dim + cfg.dim + 3 * cfg.dim * cfg.hidden
     )
     var head_words = cfg.dim + cfg.vocab * cfg.dim
-    var sc_words = 2 * cfg.dim + 2 * cfg.hidden + THREADS * seq_cap
+    var sc_words = PREFILL_BATCH * (2 * cfg.dim + 2 * cfg.hidden) + THREADS * seq_cap
 
     # --- Device setup (standard Mojo DeviceContext API) -------------------
     var ctx = DeviceContext(api="t1")
@@ -1128,8 +1317,8 @@ def main() raises:
     var wl_b = ctx.enqueue_create_buffer[DType.float32](layer_words)
     var wh_b = ctx.enqueue_create_buffer[DType.float32](head_words)
     var hdr_b = ctx.enqueue_create_buffer[DType.int32](8)
-    var rope_b = ctx.enqueue_create_buffer[DType.float32](cfg.head_size)
-    var x_b = ctx.enqueue_create_buffer[DType.float32](cfg.dim)
+    var rope_b = ctx.enqueue_create_buffer[DType.float32](PREFILL_BATCH * cfg.head_size)
+    var x_b = ctx.enqueue_create_buffer[DType.float32](PREFILL_BATCH * cfg.dim)
     var sc_b = ctx.enqueue_create_buffer[DType.float32](sc_words)
     var logits_b = ctx.enqueue_create_buffer[DType.float32](cfg.vocab)
     var kv_bufs = List[DeviceBuffer[DType.float32]]()
@@ -1160,35 +1349,42 @@ def main() raises:
     hdr_host[5] = Int32(cfg.head_size)
     hdr_host[6] = Int32(seq_cap)
     hdr_host[7] = Int32(cfg.vocab)
-    var rope_host = List[Float32](length=cfg.head_size, fill=0)
-    var emb_host = List[Float32](length=cfg.dim, fill=0)
+    var rope_host = List[Float32](length=PREFILL_BATCH * cfg.head_size, fill=0)
+    var emb_host = List[Float32](length=PREFILL_BATCH * cfg.dim, fill=0)
 
     # --- Generation loop --------------------------------------------------
     print("prompt tokens:", len(prompt_toks), " steps:", steps)
+    print("prefill batch:", PREFILL_BATCH)
     var token = prompt_toks[0]
     var pos = 0
     var out_text = String("")
     var t_start = perf_counter_ns()
     while pos < steps:
         var t0 = perf_counter_ns()
+        var rows = min(PREFILL_BATCH, min(steps - pos, max(1, len(prompt_toks) - pos)))
 
         # Embedding row -> x (host lookup, device write).
-        _ = f.seek(emb_off + 4 * token * cfg.dim)
-        _read_full(f, emb_host.unsafe_ptr(), cfg.dim)
+        for row in range(rows):
+            var input_token = prompt_toks[pos + row] if pos < len(prompt_toks) else token
+            _ = f.seek(emb_off + 4 * input_token * cfg.dim)
+            _read_full(f, emb_host.unsafe_ptr().unsafe_offset(row * cfg.dim), cfg.dim)
+        if pos < len(prompt_toks):
+            token = prompt_toks[pos + rows - 1]
         x_b.enqueue_copy_from(emb_host.unsafe_ptr())
 
         # Position-dependent inputs.
         hdr_host[0] = Int32(pos)
         hdr_b.enqueue_copy_from(hdr_host.unsafe_ptr())
-        var hd = 0
-        while hd < cfg.head_size:
-            var freq = exp(
-                -log(Float32(10000.0)) * Float32(hd) / Float32(cfg.head_size)
-            )
-            var val = Float32(pos) * freq
-            rope_host[hd] = cos(val)
-            rope_host[hd + 1] = sin(val)
-            hd += 2
+        for row in range(rows):
+            var hd = 0
+            while hd < cfg.head_size:
+                var freq = exp(
+                    -log(Float32(10000.0)) * Float32(hd) / Float32(cfg.head_size)
+                )
+                var val = Float32(pos + row) * freq
+                rope_host[row * cfg.head_size + hd] = cos(val)
+                rope_host[row * cfg.head_size + hd + 1] = sin(val)
+                hd += 2
         rope_b.enqueue_copy_from(rope_host.unsafe_ptr())
 
         # One launch per layer; weights streamed from disk.
@@ -1221,20 +1417,30 @@ def main() raises:
             _ = f.seek(w3_off + 4 * l * cfg.dim * cfg.hidden)
             _read_mat(f, sp.unsafe_offset(o), cfg.hidden, cfg.dim, tmp)
             wl_b.enqueue_copy_from(sp)
-            ctx.enqueue_function[t1_layer](
-                hdr_b, rope_b, x_b, wl_b, kv_bufs[l], sc_b,
-                grid_dim=1, block_dim=THREADS,
-            )
+            if rows > 1:
+                ctx.enqueue_function[t1_prefill_layer](
+                    hdr_b, rope_b, x_b, wl_b, kv_bufs[l], sc_b, Int32(rows),
+                    grid_dim=1, block_dim=THREADS,
+                )
+            else:
+                ctx.enqueue_function[t1_layer[False]](
+                    hdr_b, rope_b, x_b, wl_b, kv_bufs[l], sc_b,
+                    grid_dim=1, block_dim=THREADS,
+                )
+            if first_layer_only:
+                ctx.synchronize()
+                print("First layer complete: position", pos, "tokens", rows, "layer", l)
+                return
 
-        ctx.enqueue_function[t1_head](
-            hdr_b, x_b, wh_b, logits_b, sc_b, grid_dim=1, block_dim=THREADS
+        ctx.enqueue_function[t1_prefill_head](
+            hdr_b, x_b, wh_b, logits_b, sc_b, Int32(rows), grid_dim=1, block_dim=THREADS
         )
         ctx.synchronize()
 
         # Next token: forced while consuming the prompt, then greedy argmax.
         var next_tok: Int
-        if pos + 1 < len(prompt_toks):
-            next_tok = prompt_toks[pos + 1]
+        if pos + rows < len(prompt_toks):
+            next_tok = prompt_toks[pos + rows]
         else:
             var best = 0
             var best_v = Float32(-1e30)
@@ -1250,14 +1456,14 @@ def main() raises:
         var piece = tok.decode(token, next_tok)
         # Only generated tokens go into the transcript; forced prompt
         # tokens are already part of the prompt text.
-        if pos + 1 >= len(prompt_toks):
+        if pos + rows >= len(prompt_toks):
             out_text += piece
         var ms = (perf_counter_ns() - t0) // 1_000_000
         print(
-            "[pos", pos, "->", next_tok, "|", ms, "ms]", piece,
+            "[pos", pos + rows - 1, "->", next_tok, "|", ms, "ms]", piece,
         )
         token = next_tok
-        pos += 1
+        pos += rows
 
     var total_s = (perf_counter_ns() - t_start) // 1_000_000_000
     print("")

@@ -45,6 +45,8 @@ stdenvNoCC.mkDerivation {
     install -m755 saxpy "$out/bin/t1-saxpy"
     "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/t1llama.mojo" -o t1llama
     install -m755 t1llama "$out/bin/t1llama"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_PREFILL_GEMM=0 "$out/share/t1/examples/t1llama.mojo" -o t1llama-prefill-serial
+    install -m755 t1llama-prefill-serial "$out/bin/t1llama-prefill-serial"
     "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_THREADS=1 "$out/share/t1/examples/t1llama.mojo" -o t1llama-single
     install -m755 t1llama-single "$out/bin/t1llama-single"
     "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_VME=0 "$out/share/t1/examples/t1llama.mojo" -o t1llama-rvv
@@ -53,6 +55,22 @@ stdenvNoCC.mkDerivation {
     install -m755 t1-threaded "$out/bin/t1-threaded"
     "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/vme.mojo" -o t1-vme
     install -m755 t1-vme "$out/bin/t1-vme"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/vme_gemm.mojo" -o t1-vme-gemm
+    install -m755 t1-vme-gemm "$out/bin/t1-vme-gemm"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_GEMM_ROWS=1 "$out/share/t1/examples/vme_gemm.mojo" -o t1-vme-gemm-serial
+    install -m755 t1-vme-gemm-serial "$out/bin/t1-vme-gemm-serial"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/vme_gemm_quantized.mojo" -o t1-vme-gemm-quantized
+    install -m755 t1-vme-gemm-quantized "$out/bin/t1-vme-gemm-quantized"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_PREFILL_GEMM=0 "$out/share/t1/examples/vme_gemm_quantized.mojo" -o t1-vme-gemm-quantized-serial
+    install -m755 t1-vme-gemm-quantized-serial "$out/bin/t1-vme-gemm-quantized-serial"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 -D T1_PREFILL_INTERLEAVE=1 "$out/share/t1/examples/vme_gemm_quantized.mojo" -o t1-vme-gemm-quantized-interleaved
+    install -m755 t1-vme-gemm-quantized-interleaved "$out/bin/t1-vme-gemm-quantized-interleaved"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/prefill.mojo" -o t1-prefill
+    install -m755 t1-prefill "$out/bin/t1-prefill"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/swiglu.mojo" -o t1-swiglu
+    install -m755 t1-swiglu "$out/bin/t1-swiglu"
+    "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/scalar_vector_hazard.mojo" -o t1-scalar-vector-hazard
+    install -m755 t1-scalar-vector-hazard "$out/bin/t1-scalar-vector-hazard"
     "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/vme_quantized.mojo" -o t1-vme-quantized
     install -m755 t1-vme-quantized "$out/bin/t1-vme-quantized"
     "$out/bin/mojo-t1" build --target-accelerator=t1 "$out/share/t1/examples/rmsnorm.mojo" -o t1-rmsnorm
