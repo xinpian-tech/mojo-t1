@@ -356,6 +356,58 @@ ISA readbacks. Runs are preserved under `/tmp/store-config-*-rtl` and
 `/nix/store/44vyrc0a8rkzn3g1rkf32jswrgk1a4sy-mojo-t1-0.1.0`, built with
 `nix build .#t1 -o /tmp/mojo-t1-store-config`.
 
+### Current segmented prefill path and RTL limit
+
+The current path packs K=4 fields together, uses LMUL=2 segmented loads with
+undisturbed tails, restores matrix configuration before computing, and
+initializes FP32 outputs in the first group epilogue instead of a separate
+byte-wise clear. It retains legacy weights for decode/reference execution.
+
+On the same four-token Stories15M layer 0 and repaired four-hart RTL:
+
+| Path | Kernel cycles | Total simulator cycles |
+| --- | ---: | ---: |
+| Existing pure RVV, FP32 | 1,309,351 | 1,309,664 |
+| Original VME GEMM | 1,901,030 | 1,901,340 |
+| Before segmented packing | 1,118,944 | 1,119,257 |
+| Segmented loads, agnostic tails | 944,642 | 944,952 |
+| Also fuse output initialization | 850,033 | 850,346 |
+| Also use undisturbed load tails (current) | **752,644** | **752,957** |
+
+The latest changes save **32.7%** versus 1,118,944 cycles. The current path
+is **2.526x faster than the original VME GEMM** and **1.740x faster than the
+existing FP32 RVV path**. This remains a device-kernel, single-layer comparison
+with different RVV/VME precisions, not an end-to-end or full-model speedup.
+Host repacking and simulator startup are excluded.
+
+All three segmented versions have the same complete 41,199,424-byte readback,
+identical to their ISA references, SHA-256
+`cc8aa84ee36e8a8cdf69a13e92a14f61a52a8502937e5be4d2997f04af2b876b`.
+The residual and full KV buffers also match the legacy VME result byte for
+byte; whole old/new dumps differ because weight copies and activation scratch
+now have a different packed representation. Token counts 1–4 and blocking/
+interleaved quantized GEMM pass RTL and complete ISA readback comparisons.
+The serial reference ELF and ISA dump are unchanged from its validated RTL run.
+
+The final complete trace exposes a hardware throughput constraint: **four
+global physical instruction slots**, average occupancy **3.584/4**, all four
+occupied for **72.7%** of the observed physical window. Ordinary short loads
+take about 21 cycles to return; segment loads, tile transfers and vector
+epilogues also hold slots for many cycles. Controlled resident/load-only/
+configuration/ping-pong experiments separate this limit from scalar work and
+do not support calling it DRAM bandwidth saturation. See the
+[tuning guide](docs/tuning-guide.md#physical-instruction-slot-occupancy) for
+source-level evidence, occupancy scope, counters and attribution limits.
+No new functional RTL bug was found; larger issue-credit pools or shorter
+operation lifetimes require separate RTL experiments, not a claimed speedup.
+
+Final build: `nix build .#t1 -o /tmp/mojo-t1-segmented-tu`, package
+`/nix/store/nnbylspr09lam2wi1hipjaks684lqaqd-mojo-t1-0.1.0`.
+Artifacts: `/tmp/segmented-tu-stories-model` and
+`/tmp/segmented-tu-stories-rtl` (complete streamed trace replay). Intermediate
+runs use `/tmp/segmented-prefill-stories-{model,rtl}` and
+`/tmp/segmented-init-stories-{model,rtl}`. Upstream Mojo and RTL are unchanged.
+
 ### Historical single-token VME performance evaluation
 
 The TinyLlama 1.1B first transformer layer at position 0 completes on the

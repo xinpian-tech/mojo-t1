@@ -5,7 +5,7 @@ from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
 from std.math import cos, exp, log, sin
 from std.sys import argv
-from t1llama import t1_layer, t1_prefill_layer, F32Ptr, I32Ptr
+from t1llama import t1_layer, t1_prefill_layer, F32Ptr, I32Ptr, _pack_segmented_weights
 
 comptime ROWS = 4
 comptime DIM = 64
@@ -45,6 +45,7 @@ def pack_matrix[origin: MutOrigin, //](destination: Pointer[Float32, origin], ou
                 total += Int32(value)
             scales[group * outputs + column] = Float32(1 + (column + group) % 3) / 128
             sums[group * outputs + column] = total
+    _pack_segmented_weights(destination, outputs, reduction)
 
 
 def main() raises:

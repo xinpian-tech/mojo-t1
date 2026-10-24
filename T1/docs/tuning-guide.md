@@ -15,7 +15,10 @@ cycles than the existing FP32 RVV path before shared quantization. Shared RVV
 packing and Q/K/V plus gate/up reuse reduce VME to 1,191,922 cycles: 37.3%
 below the original VME GEMM and 9.0% below the existing RVV baseline.
 Reusing epilogue metadata across rows further reduces VME to 1,127,926
-cycles, 13.9% below that RVV baseline, with identical VME readbacks.
+cycles. The current segmented/undisturbed-tail path with fused output
+initialization takes 752,644 cycles, 42.5% below that RVV baseline. VME
+residual and KV results remain unchanged; packed scratch/weight copies differ
+from the legacy layout.
 RVV versus VME compares different
 precisions; GEMV versus GEMM uses the same group-32 quantization. None is
 full-inference acceptance, and results from different models/token counts
@@ -79,7 +82,8 @@ The following implementation constraints were checked in T1 commit
 Prefill processes up to four already-known consecutive prompt tokens per
 layer launch. Each hart owns output columns across all token rows, so a
 weight tile is reused across those rows. Activations are quantized separately
-per token and per group of 32, then packed as `[K,token]`. Each output row uses
+per token and per group of 32. The legacy pack is `[K,token]`; the current
+segment-load pack is `[K/4,token,K%4]`. Each output row uses
 its own activation scale and the existing per-output weight scale and sum.
 Quantization groups cannot be merged into one integer accumulation when their
 scales differ.
@@ -97,6 +101,25 @@ ties-away-from-zero rounding, RTZ conversion and clipping remain unchanged;
 no reciprocal approximation or quantization precision change is introduced.
 The generic `_matmul` and single-token GEMV retain the scalar packer as
 independent references; shared packing currently optimizes prefill only.
+
+The segment-load fast path stores four quantized activation bytes together
+using strided 32-bit stores, producing `[K/4,4,4]` without a separate transpose
+pass. Host packing appends a `[K/4,N,4]` INT8 weight copy after the legacy
+INT8 weights, FP32 scales and INT32 sums. Both copies and metadata occupy
+2.25 bytes per original weight and fit inside the existing four-byte-per-weight
+allocation; buffer sizes and decode's legacy layout do not change. This does
+add host repacking work, excluded from the device-cycle measurements.
+
+Two `vlseg4e8.v` instructions under LMUL=2 replace eight separate byte-vector
+loads per K=4 step. Matrix configuration is restored before `vtmmu`; it reads
+the even registers under derived LMUL=1. `tu` avoids filling unused tails.
+The first group adds its scaled result to vector positive zero rather than
+loading a pre-cleared output. Later groups retain the original ordered FP32
+additions. This removes the byte-wise `memset` without changing signed-zero
+behavior or fusing/reassociating the floating-point operations.
+
+`T1_PREFILL_SEGMENTED=0` selects the legacy load/pack implementation for
+diagnostics. `T1_PREFILL_GEMM=0` still selects the scalar-packed GEMV reference.
 
 Q/K/V and FFN projections use this GEMM path. RoPE uses each token's actual
 position; attention reads only positions up to that token, even though the

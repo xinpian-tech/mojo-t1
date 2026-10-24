@@ -30,7 +30,7 @@
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_dim
 from max.gpu.sync import barrier
-from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, accumulate_scaled_rows, matrix_submit, matrix_finish, quantize_group32
+from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, accumulate_scaled_rows, matrix_submit, matrix_submit_segmented, matrix_finish, quantize_group32
 from std.memory import unsafe_stack_allocation
 from std.collections import Dict
 from std.io.file import FileHandle
@@ -76,6 +76,7 @@ comptime THREADS = get_defined_int["T1_THREADS", 4]()
 comptime USE_VME = get_defined_int["T1_VME", 1]() != 0
 comptime PREFILL_GEMM = get_defined_int["T1_PREFILL_GEMM", 1]() != 0
 comptime PREFILL_INTERLEAVE = get_defined_int["T1_PREFILL_INTERLEAVE", 0]() != 0
+comptime PREFILL_SEGMENTED = get_defined_int["T1_PREFILL_SEGMENTED", 1]() != 0
 comptime PREFILL_BATCH = get_defined_int["T1_PREFILL_BATCH", 4]()
 comptime MV_LMUL = get_defined_int["T1_MV_LMUL", 2]()
 comptime MV_TRANSPOSED = get_defined_int["T1_MV_T", 1]() != 0
@@ -473,9 +474,10 @@ def _prepare_activations(inputs: F32Ptr, workspace: F32Ptr, rows: Int, reduction
         for task in range(thread_idx.x, groups * rows, block_dim.x):
             var group = task // rows
             var row = task % rows
-            scales[group * 4 + row] = quantize_group32(
+            scales[group * 4 + row] = quantize_group32[segmented=PREFILL_SEGMENTED](
                 inputs.unsafe_offset(row * input_stride + group * 32),
-                packed.unsafe_offset(group * 128 + row), 4,
+                packed.unsafe_offset(group * 128 + row * (4 if PREFILL_SEGMENTED else 1)),
+                16 if PREFILL_SEGMENTED else 4,
             )
         barrier()
 
@@ -489,7 +491,8 @@ def _matmul_prepared[prepared: Bool = True](
     """Projects rows using shared prepared activations, or the scalar reference packer.
 
     The prepared path accepts one to four rows and requires a completed
-    _prepare_activations call for these inputs. All harts participate.
+    _prepare_activations call for these inputs. Reduction is a positive multiple
+    of 32. All harts participate.
     """
     comptime if not USE_VME or not PREFILL_GEMM:
         for row in range(rows):
@@ -508,9 +511,10 @@ def _matmul_prepared[prepared: Bool = True](
         var last = outputs * (thread_idx.x + 1) // block_dim.x
         for row_base in range(0, rows, 4):
             var row_count = min(4, rows - row_base)
-            for row in range(row_count):
-                for column in range(first, last):
-                    out_ptr[(row_base + row) * output_stride + column] = 0
+            comptime if not prepared:
+                for row in range(row_count):
+                    for column in range(first, last):
+                        out_ptr[(row_base + row) * output_stride + column] = 0
             for group in range(reduction // 32):
                 comptime if prepared:
                     quantized = workspace.bitcast[UInt8]().unsafe_offset(group * 128)
@@ -532,10 +536,16 @@ def _matmul_prepared[prepared: Bool = True](
                 var slot = 0
                 for column in range(first, last, 32):
                     var count = min(32, last - column)
-                    matrix_submit(
-                        packed.unsafe_offset(group * 32 * outputs + column),
-                        quantized, 32, row_count, count, outputs, 4,
-                    )
+                    comptime if prepared and PREFILL_SEGMENTED:
+                        matrix_submit_segmented(
+                            weights.unsafe_offset(outputs * reduction * 5 // 16).bitcast[Int8]().unsafe_offset(group * 32 * outputs + column * 4),
+                            quantized, 32, row_count, count, outputs * 4,
+                        )
+                    else:
+                        matrix_submit(
+                            packed.unsafe_offset(group * 32 * outputs + column),
+                            quantized, 32, row_count, count, outputs, 4,
+                        )
                     comptime if not PREFILL_INTERLEAVE:
                         matrix_finish(accumulator, row_count, count, 32)
                     var result_column = previous if PREFILL_INTERLEAVE else column
@@ -548,7 +558,7 @@ def _matmul_prepared[prepared: Bool = True](
                                 out_ptr.unsafe_offset(row_base * output_stride + result_column),
                                 accumulator.unsafe_offset(result_slot), sums.unsafe_offset(metadata),
                                 scales.unsafe_offset(metadata), activation_scales, result_count,
-                                row_count, output_stride, 32,
+                                row_count, output_stride, 32, group == 0,
                             )
                         else:
                             for row in range(row_count):
@@ -570,7 +580,7 @@ def _matmul_prepared[prepared: Bool = True](
                                 out_ptr.unsafe_offset(row_base * output_stride + previous),
                                 accumulator.unsafe_offset((1 - slot) * 128), sums.unsafe_offset(metadata),
                                 scales.unsafe_offset(metadata), activation_scales, previous_count,
-                                row_count, output_stride, 32,
+                                row_count, output_stride, 32, group == 0,
                             )
                         else:
                             for row in range(row_count):
@@ -1128,6 +1138,21 @@ def _read_full(f: FileHandle, ptr: Pointer[mut=True, Float32, _], n: Int) raises
         got += bytes_read // 4
 
 
+def _pack_segmented_weights[origin: MutOrigin, //](weights: Pointer[Float32, origin], outputs: Int, reduction: Int):
+    """Adds a [K/4,N,4] INT8 copy after legacy weights/scales/sums.
+
+    Reduction must be divisible by 32. Both layouts and metadata fit within
+    the existing outputs*reduction FP32 allocation; decode retains its layout.
+    """
+    comptime if USE_VME and PREFILL_GEMM and PREFILL_SEGMENTED:
+        var source = weights.bitcast[Int8]()
+        var destination = weights.unsafe_offset(outputs * reduction * 5 // 16).bitcast[Int8]()
+        for chunk in range(reduction // 4):
+            for column in range(outputs):
+                for inner in range(4):
+                    destination[(chunk * outputs + column) * 4 + inner] = source[(chunk * 4 + inner) * outputs + column]
+
+
 def _read_mat[
     o1: MutOrigin, //
 ](f: FileHandle, dst: Pointer[Float32, o1], m: Int, n: Int,
@@ -1157,6 +1182,7 @@ def _read_mat[
                     total += Int32(quantized)
                 scales[group * m + row] = scale
                 sums[group * m + row] = total
+        _pack_segmented_weights(dst, m, n)
     elif MV_TRANSPOSED:
         _read_full(f, tmp.unsafe_ptr(), m * n)
         var tp = tmp.unsafe_ptr()

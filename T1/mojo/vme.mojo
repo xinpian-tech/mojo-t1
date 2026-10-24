@@ -4,13 +4,15 @@ from std.sys import inlined_assembly
 
 
 @always_inline
-def quantize_group32[input_origin: MutOrigin, output_origin: MutOrigin, //](
+def quantize_group32[input_origin: MutOrigin, output_origin: MutOrigin, //, segmented: Bool = False](
     source: Pointer[Float32, input_origin], destination: Pointer[UInt8, output_origin],
     stride: Int,
 ) -> Float32:
     """Packs 32 finite FP32 values with symmetric scaling and ties away from zero.
 
     Requires VLEN >= 1024. Destination has room for 32 strided bytes.
+    Segmented mode stores eight packed words at the supplied byte stride;
+    its destination must be four-byte aligned.
     Division and RTZ conversion preserve the scalar group-32 quantizer.
     """
     var magnitude = inlined_assembly[
@@ -25,7 +27,17 @@ def quantize_group32[input_origin: MutOrigin, output_origin: MutOrigin, //](
         constraints="=f,r,~{t0},~{v8},~{v9},~{v10},~{memory}",
     ](source)
     var scale = magnitude / 127 if magnitude > 0 else Float32(1)
+    comptime assembly = StaticString(materialize[_quantize_pack_asm[segmented]()]())
     inlined_assembly[
+        assembly,
+        NoneType,
+        constraints="r,r,r,f,f,~{t0},~{t1},~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{memory}",
+    ](source, destination, stride, scale, Float32(0.5))
+    return scale
+
+
+def _quantize_pack_asm[segmented: Bool]() -> String:
+    var assembly = String(
         "li t0, 32\n"
         "vsetvli zero, t0, e32, m1, ta, ma\n"
         "vle32.v v8, ($0)\n"
@@ -44,11 +56,12 @@ def quantize_group32[input_origin: MutOrigin, output_origin: MutOrigin, //](
         "vnsrl.wi v10, v12, 0\n"
         "vsetvli zero, t0, e8, m1, ta, ma\n"
         "vnsrl.wi v8, v10, 0\n"
-        "vsse8.v v8, ($1), $2\n",
-        NoneType,
-        constraints="r,r,r,f,f,~{t0},~{t1},~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{memory}",
-    ](source, destination, stride, scale, Float32(0.5))
-    return scale
+    )
+    if segmented:
+        assembly += "li t0, 8\nvsetvli zero, t0, e32, m1, ta, ma\nvsse32.v v8, ($1), $2\n"
+    else:
+        assembly += "vsse8.v v8, ($1), $2\n"
+    return assembly
 
 
 @always_inline
@@ -127,6 +140,53 @@ def matrix_submit[weight_origin: MutOrigin, input_origin: MutOrigin, //](
         constraints="r,r,r,r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{t6},"
         "~{v8},~{v10},~{v12},~{v14},~{v16},~{v18},~{v20},~{v22},~{memory}",
     ](weights, inputs, reduction, rows, columns, weight_stride, input_stride)
+
+
+@always_inline
+def matrix_submit_segmented[weight_origin: MutOrigin, input_origin: MutOrigin, //](
+    weights: Pointer[Int8, weight_origin], inputs: Pointer[UInt8, input_origin],
+    reduction: Int, rows: Int, columns: Int, weight_chunk_stride: Int,
+):
+    """Submits tile 4 from [K/4,N,4] weights and [K/4,4,4] activations.
+
+    Rows are in 1..4, columns in 1..32, and reduction is a positive multiple
+    of four. Chunk stride is in bytes. LMUL=2 segment loads populate even
+    registers with undisturbed tails; restoring matrix configuration derives LMUL=1 without changing
+    the loaded bytes. Uses v0-v15, leaving v24-v27 for independent epilogues.
+    """
+    inlined_assembly[
+        "mv t2, $0\n"
+        "mv t3, $1\n"
+        "mv t4, $2\n"
+        "mv t5, $5\n"
+        "slli t6, $3, 10\n"
+        "ori t6, t6, 131\n"
+        "mv t0, t6\n"
+        "li t1, 256\n"
+        ".word 0x8462f057\n"
+        "mv t0, $4\n"
+        ".word 0x8802f057\n"
+        ".word 0x43e06457\n"
+        "1:\n"
+        "vsetvli zero, $3, e8, m2, tu, ma\n"
+        "vlseg4e8.v v0, (t3)\n"
+        "vsetvli zero, $4, e8, m2, tu, ma\n"
+        "vlseg4e8.v v8, (t2)\n"
+        "mv t0, t6\n"
+        "li t1, 256\n"
+        ".word 0x8462f057\n"
+        "mv t0, $4\n"
+        ".word 0x8802f057\n"
+        ".word 0xf2040477\n"
+        "addi t3, t3, 16\n"
+        "add t2, t2, t5\n"
+        "addi t4, t4, -4\n"
+        "bnez t4, 1b\n",
+        NoneType,
+        constraints="r,r,r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{t6},"
+        "~{v0},~{v1},~{v2},~{v3},~{v4},~{v5},~{v6},~{v7},"
+        "~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{v14},~{v15},~{memory}",
+    ](weights, inputs, reduction, rows, columns, weight_chunk_stride)
 
 
 @always_inline
@@ -272,12 +332,14 @@ def accumulate_scaled_rows[
     scales: Pointer[Float32, scale_origin],
     activation_scales: Pointer[Float32, activation_origin],
     count: Int, rows: Int, output_stride: Int, accumulator_stride: Int,
+    initialize: Bool = False,
 ):
     """Scales tile rows while loading their shared weight metadata only once.
 
     Count is in 1..32 and rows is positive. Strides count 32-bit elements.
     Uses only v24-v27, independently of
     matrix operand registers, and preserves the single-row arithmetic order.
+    Initialize uses positive zero instead of reading the previous output.
     """
     inlined_assembly[
         "mv t0, $0\n"
@@ -290,6 +352,7 @@ def accumulate_scaled_rows[
         "vle32.v v25, ($2)\n"
         "vsll.vi v25, v25, 7\n"
         "vle32.v v26, ($3)\n"
+        "vmv.v.i v27, 0\n"
         "1:\n"
         "flw ft0, 0(t2)\n"
         "vle32.v v24, (t1)\n"
@@ -297,7 +360,9 @@ def accumulate_scaled_rows[
         "vfcvt.f.x.v v24, v24\n"
         "vfmul.vf v24, v24, ft0\n"
         "vfmul.vv v24, v24, v26\n"
+        "bnez $9, 2f\n"
         "vle32.v v27, (t0)\n"
+        "2:\n"
         "vfadd.vv v24, v24, v27\n"
         "vse32.v v24, (t0)\n"
         "addi t2, t2, 4\n"
@@ -306,9 +371,9 @@ def accumulate_scaled_rows[
         "addi t3, t3, -1\n"
         "bnez t3, 1b\n",
         NoneType,
-        constraints="r,r,r,r,r,r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{ft0},"
+        constraints="r,r,r,r,r,r,r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{ft0},"
         "~{v24},~{v25},~{v26},~{v27},~{memory}",
-    ](output, accumulator, sums, scales, activation_scales, count, rows, output_stride, accumulator_stride)
+    ](output, accumulator, sums, scales, activation_scales, count, rows, output_stride, accumulator_stride, initialize)
 
 
 @always_inline

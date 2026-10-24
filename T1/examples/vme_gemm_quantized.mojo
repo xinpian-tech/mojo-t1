@@ -1,7 +1,7 @@
 """Checks quantized token batches, zero rows, row tails and column tails."""
 
 from max.gpu.host import DeviceContext
-from t1llama import _matmul, _matmul_prepared, _prepare_activations
+from t1llama import _matmul, _matmul_prepared, _prepare_activations, _pack_segmented_weights
 
 
 def matrix(
@@ -57,6 +57,7 @@ def main() raises:
                     total += Int32(value)
                 scales[group * 140 + column] = Float32(group + 1) / 16
                 sums[group * 140 + column] = total
+        _pack_segmented_weights(host.unsafe_ptr(), 140, 64)
     with inputs.map_to_host() as host:
         for row in range(5):
             for inner in range(67):
