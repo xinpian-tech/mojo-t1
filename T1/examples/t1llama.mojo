@@ -30,7 +30,7 @@
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_dim
 from max.gpu.sync import barrier
-from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, matrix_submit, matrix_finish, quantize_group32
+from max._plugin.t1_vme import matvec_submit, matvec_finish, accumulate_scaled, accumulate_scaled_rows, matrix_submit, matrix_finish, quantize_group32
 from std.memory import unsafe_stack_allocation
 from std.collections import Dict
 from std.io.file import FileHandle
@@ -543,12 +543,20 @@ def _matmul_prepared[prepared: Bool = True](
                     var result_slot = (1 - slot) * 128 if PREFILL_INTERLEAVE else 0
                     var metadata = group * outputs + result_column
                     if result_count:
-                        for row in range(row_count):
-                            accumulate_scaled(
-                                out_ptr.unsafe_offset((row_base + row) * output_stride + result_column),
-                                accumulator.unsafe_offset(result_slot + row * 32), sums.unsafe_offset(metadata),
-                                scales.unsafe_offset(metadata), activation_scales[row], result_count,
+                        comptime if prepared:
+                            accumulate_scaled_rows(
+                                out_ptr.unsafe_offset(row_base * output_stride + result_column),
+                                accumulator.unsafe_offset(result_slot), sums.unsafe_offset(metadata),
+                                scales.unsafe_offset(metadata), activation_scales, result_count,
+                                row_count, output_stride, 32,
                             )
+                        else:
+                            for row in range(row_count):
+                                accumulate_scaled(
+                                    out_ptr.unsafe_offset((row_base + row) * output_stride + result_column),
+                                    accumulator.unsafe_offset(result_slot + row * 32), sums.unsafe_offset(metadata),
+                                    scales.unsafe_offset(metadata), activation_scales[row], result_count,
+                                )
                     comptime if PREFILL_INTERLEAVE:
                         matrix_finish(accumulator.unsafe_offset(slot * 128), row_count, count, 32)
                         previous = column
@@ -556,13 +564,21 @@ def _matmul_prepared[prepared: Bool = True](
                         slot = 1 - slot
                 comptime if PREFILL_INTERLEAVE:
                     var metadata = group * outputs + previous
-                    for row in range(row_count):
-                        if previous_count:
-                            accumulate_scaled(
-                                out_ptr.unsafe_offset((row_base + row) * output_stride + previous),
-                                accumulator.unsafe_offset((1 - slot) * 128 + row * 32), sums.unsafe_offset(metadata),
-                                scales.unsafe_offset(metadata), activation_scales[row], previous_count,
+                    if previous_count:
+                        comptime if prepared:
+                            accumulate_scaled_rows(
+                                out_ptr.unsafe_offset(row_base * output_stride + previous),
+                                accumulator.unsafe_offset((1 - slot) * 128), sums.unsafe_offset(metadata),
+                                scales.unsafe_offset(metadata), activation_scales, previous_count,
+                                row_count, output_stride, 32,
                             )
+                        else:
+                            for row in range(row_count):
+                                accumulate_scaled(
+                                    out_ptr.unsafe_offset((row_base + row) * output_stride + previous),
+                                    accumulator.unsafe_offset((1 - slot) * 128 + row * 32), sums.unsafe_offset(metadata),
+                                    scales.unsafe_offset(metadata), activation_scales[row], previous_count,
+                                )
         barrier()
 
 

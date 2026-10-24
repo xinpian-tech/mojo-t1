@@ -14,6 +14,8 @@ GEMM improves over equal-precision VME GEMV by 1.762x, but takes 45.2% more
 cycles than the existing FP32 RVV path before shared quantization. Shared RVV
 packing and Q/K/V plus gate/up reuse reduce VME to 1,191,922 cycles: 37.3%
 below the original VME GEMM and 9.0% below the existing RVV baseline.
+Reusing epilogue metadata across rows further reduces VME to 1,127,926
+cycles, 13.9% below that RVV baseline, with identical VME readbacks.
 RVV versus VME compares different
 precisions; GEMV versus GEMM uses the same group-32 quantization. None is
 full-inference acceptance, and results from different models/token counts
@@ -214,6 +216,39 @@ and `80102d94:80102e5c` (hex). The epilogue ranges are
 `801006a8:80100708`, `80100b58:80100bba`, `80100ffa:80101064`,
 `80101ba0:80101c0a`, `8010233e:801023aa`, `801027be:8010282a`,
 and `80102f64:80102fd0`. Re-derive ranges from disassembly after code changes.
+
+### Next hotspot after shared packing
+
+A fresh streamed profile of the shared-quantization ELF reproduces
+1,191,922 kernel cycles, 1,192,235 total cycles, and its complete ISA readback.
+It retires 700,526 instructions across four harts (down from 1,553,808), but
+still executes 73,728 `vle8.v` operand loads and 9,216 `vtmmu` operations.
+The group epilogue reloads weight sums 4,608 times and weight scales 4,608
+times, even though the four token rows use identical weight metadata.
+
+Hart 0's epilogue setup/row-loop PC regions account for 512,453 of 1,192,198
+following-retirement-gap cycles (43.0%). The other harts show 42.4–42.8%.
+This includes waits for earlier matrix/vector work: it is not 43% exclusive
+FP conversion execution time. The half-open regions in this ELF are
+`80100840:801008a4`, `80100c9e:80100d02`, `801010b4:8010111c`,
+`80101d0a:80101d70`, `801025e0:80102648`, `801029e2:80102a48`,
+and `801032d2:80103338`. Raw summaries and instruction counts are preserved
+in `/tmp/shared-quant-stories-profile`.
+
+`accumulate_scaled_rows` hoists vector configuration, weight scale loads,
+and shifted weight sums out of the token-row loop. Each row still uses its
+own activation scale and INT32 result; the subtract/convert/multiply/multiply/
+add sequence is unchanged, with no FMA contraction. For four-token Stories15M,
+the code reduces metadata loads from 9,216 to 2,304 and row-epilogue `vsetvli`
+instructions from 4,608 to 1,152. These are workload-derived instruction
+counts, not a claimed reduction in elapsed cycles. It uses v24–v27 only,
+preserving the optional overlap with matrix operands in v8–v22.
+
+The same-layer RTL measurement drops from 1,191,922 to 1,127,926 kernel
+cycles (5.4% fewer), with byte-identical complete dumps before/after and
+against the ISA reference. Metadata reuse does not eliminate the remaining
+73,728 operand-load instructions or per-group tile-result traffic. Reducing
+those costs is separate work, not an additional speedup claimed here.
 
 ### Confirmed scalar-to-vector correctness failure
 

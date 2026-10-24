@@ -254,6 +254,56 @@ def matvec_finish[output_origin: MutOrigin, //](
 
 
 @always_inline
+def accumulate_scaled_rows[
+    output_origin: MutOrigin, accumulator_origin: MutOrigin,
+    sum_origin: MutOrigin, scale_origin: MutOrigin, activation_origin: MutOrigin, //
+](
+    output: Pointer[Float32, output_origin],
+    accumulator: Pointer[Int32, accumulator_origin],
+    sums: Pointer[Int32, sum_origin],
+    scales: Pointer[Float32, scale_origin],
+    activation_scales: Pointer[Float32, activation_origin],
+    count: Int, rows: Int, output_stride: Int, accumulator_stride: Int,
+):
+    """Scales tile rows while loading their shared weight metadata only once.
+
+    Count is in 1..32 and rows is positive. Strides count 32-bit elements.
+    Uses only v24-v27, independently of
+    matrix operand registers, and preserves the single-row arithmetic order.
+    """
+    inlined_assembly[
+        "mv t0, $0\n"
+        "mv t1, $1\n"
+        "mv t2, $4\n"
+        "mv t3, $6\n"
+        "slli t4, $7, 2\n"
+        "slli t5, $8, 2\n"
+        "vsetvli zero, $5, e32, m1, ta, ma\n"
+        "vle32.v v25, ($2)\n"
+        "vsll.vi v25, v25, 7\n"
+        "vle32.v v26, ($3)\n"
+        "1:\n"
+        "flw ft0, 0(t2)\n"
+        "vle32.v v24, (t1)\n"
+        "vsub.vv v24, v24, v25\n"
+        "vfcvt.f.x.v v24, v24\n"
+        "vfmul.vf v24, v24, ft0\n"
+        "vfmul.vv v24, v24, v26\n"
+        "vle32.v v27, (t0)\n"
+        "vfadd.vv v24, v24, v27\n"
+        "vse32.v v24, (t0)\n"
+        "addi t2, t2, 4\n"
+        "add t0, t0, t4\n"
+        "add t1, t1, t5\n"
+        "addi t3, t3, -1\n"
+        "bnez t3, 1b\n",
+        NoneType,
+        constraints="r,r,r,r,r,r,r,r,r,~{t0},~{t1},~{t2},~{t3},~{t4},~{t5},~{ft0},"
+        "~{v24},~{v25},~{v26},~{v27},~{memory}",
+    ](output, accumulator, sums, scales, activation_scales, count, rows, output_stride, accumulator_stride)
+
+
+@always_inline
 def accumulate_scaled[
     output_origin: MutOrigin, accumulator_origin: MutOrigin,
     sum_origin: MutOrigin, scale_origin: MutOrigin, //

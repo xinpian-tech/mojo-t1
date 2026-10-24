@@ -305,6 +305,41 @@ row/column tails and shared-versus-scalar output comparison.
 All three quantized microtest variants and synthetic prefill token counts
 1–4 pass on the repaired RTL, with complete dumps matching their ISA runs.
 
+### Reusing epilogue metadata across token rows
+
+After shared packing, a new trace locates 43.0% of hart 0's retirement-gap
+timeline in epilogue setup/row-loop regions, including waits for queued
+matrix/vector work. Weight sums and weight scales are still each loaded
+4,608 times. The new batched epilogue loads those shared vectors and sets
+the vector configuration once per tile, not once per token row; arithmetic
+order, per-token activation scales and matrix operand registers are unchanged.
+
+On the same Stories15M first-layer workload and repaired RTL:
+
+| Path | Kernel cycles | Total simulator cycles |
+| --- | ---: | ---: |
+| Existing pure RVV | 1,309,351 | 1,309,664 |
+| VME with shared activation packing | 1,191,922 | 1,192,235 |
+| VME with shared packing and batched epilogue | 1,127,926 | 1,128,239 |
+
+This second software change saves another **5.4% of kernel cycles** (1.057x).
+The combined path is **1.161x faster than existing RVV, or 13.9% fewer
+cycles**, and 40.7% fewer cycles than the original VME GEMM. The numerical
+precision and measurement-scope qualifications above still apply.
+
+Both optimized VME versions have byte-identical complete readbacks, including
+workspace; the SHA-256 remains
+`145bb548c3336c853cc93a6efbe380bc74274cb1162d3089e510f6462f9e164b`.
+The measured package is
+`/nix/store/9zdpd0p563p3k8s6mziyrf95lcbdqw69-mojo-t1-0.1.0`, built with
+`nix build .#t1 -o /tmp/mojo-t1-row-epilogue`. Artifacts are preserved at
+`/tmp/row-epilogue-stories-rtl` and `/tmp/row-epilogue-stories-model`;
+the preceding version's trace is `/tmp/shared-quant-stories-profile`.
+See the tuning guide for PC ranges, counters and interpretation limits.
+Synthetic prefill token counts 1–4 and blocking/interleaved quantized GEMM
+pass RTL assertions and complete ISA readback comparisons. The scalar GEMV
+reference ELF is unchanged from the preceding validated package.
+
 ### Historical single-token VME performance evaluation
 
 The TinyLlama 1.1B first transformer layer at position 0 completes on the
