@@ -228,6 +228,37 @@ starting position, grouped-query attention and full residual/KV comparison
 against sequential execution. This is a layer-correctness test, not a
 full-model acceptance claim.
 
+### VME versus pure RVV on the same prefill layer
+
+Using the same Stories15M layer 0, positions 0–3, prompt, four harts and
+RAW-repaired simulator as above, `t1llama-rvv` (`T1_VME=0`) measures:
+
+| Path | Kernel cycles | Total simulator cycles |
+| --- | ---: | ---: |
+| Pure RVV, FP32 projections | 1,309,351 | 1,309,664 |
+| VME GEMM, group-32 INT8 projections | 1,901,030 | 1,901,340 |
+
+**VME still takes 1.452x as many kernel cycles as RVV (45.2% more).**
+The 1.762x improvement above is relative to VME GEMV, not to RVV. This
+comparison includes activation quantization, matrix/vector operations and
+synchronization, but excludes host packing and simulator startup. The RVV
+baseline uses its existing per-token projection implementation; this is not
+a comparison against a separately tuned RVV GEMM or a measurement of the
+matrix execution unit in isolation.
+
+Both complete 41,195,968-byte readbacks match their own ISA references.
+The RVV SHA-256 is
+`0e56b94c47d37895502df799003f1ddd8024453dd0d0c5530f9b38307bb9aa8d`;
+the VME hash is recorded above. Cross-path byte equality is not required:
+FP32 and group-32 INT8 are different numerical implementations.
+
+```sh
+python3 T1/tools/compare-layer-rtl.py \
+  --rvv /path/to/rvv-rtl --vme /path/to/gemm-rtl \
+  --rvv-reference /path/to/rvv-isa/memdump.bin \
+  --vme-reference /path/to/gemm-isa/memdump.bin
+```
+
 ### Historical single-token VME performance evaluation
 
 The TinyLlama 1.1B first transformer layer at position 0 completes on the

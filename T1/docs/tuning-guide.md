@@ -8,12 +8,13 @@ threaded configuration described in [the T1 README](../README.md) has
 throughput, latency or VRF-port limits from the older blastoise setup
 without measuring the actual configuration.
 
-The T1 README records both a historical TinyLlama single-token RVV/VME
-comparison and a Stories15M four-token prefill comparison. The former
-compares FP32 RVV with group-32 quantized VME, not equal-precision kernels.
-The latter compares equal-precision GEMV and GEMM. Neither is full-inference
-acceptance, and results from different models/token counts are not ratios
-of the same workload.
+The T1 README records a historical TinyLlama single-token RVV/VME
+comparison and two Stories15M four-token prefill comparisons. VME GEMM
+improves over equal-precision VME GEMV by 1.762x, but still takes 45.2% more
+cycles than the existing FP32 RVV path. RVV versus VME compares different
+precisions; GEMV versus GEMM uses the same group-32 quantization. None is
+full-inference acceptance, and results from different models/token counts
+are not ratios of the same workload.
 
 ## Comparison procedure
 
