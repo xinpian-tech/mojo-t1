@@ -439,6 +439,103 @@ Each complete dump matches its ISA reference. The final layer's counters
 include internal layout-transfer dispatches; physical occupancy does not
 include any extra time a parked logical reservation survives between dispatches.
 
+### PR #213: control-outstanding experiment
+
+This experiment uses PR #213 at `ded7bff69911d6329aebeb1ba90623c101d4d466`,
+not a moving branch head. The validation worktree retains the existing Rocket
+RAW/writeback and SRT correctness fixes, memory readback and event gating.
+VLEN is normalized from the PR's 2048 to the previous benchmark's 1024;
+DLEN=256, four harts and TE=32 remain unchanged. These are validation overlays,
+so the results do not describe an unmodified PR configuration. Mojo, the
+software package and each workload's ELF are unchanged.
+
+First, the four-slot PR RTL versus the previously corrected RTL, measured
+between the kernel's MMIO start/end markers:
+
+| Workload | Previous RTL cycles | PR #213 cycles |
+| --- | ---: | ---: |
+| Resident-operand matrix microkernel, 256 iterations/hart | 20,506 | 17,090 |
+| Eight ordinary loads, no repeated compute, 256 iterations/hart | 47,662 | 49,699 |
+| Segmented `tu` loads plus matrix, 256 iterations/hart | 28,587 | 30,360 |
+| Quantized GEMM regression kernel | 74,341 | 83,610 |
+| Stories15M layer 0, four known tokens | 752,644 | 1,027,059 |
+
+Resident operands still require VRF-to-VME supply; that row is not an isolated
+matrix-ALU measurement. The GEMM regression includes its fixture's work and
+must not be treated as the steady-state matrix microkernel. These are cycle
+comparisons, not frequency-normalized throughput or whole-inference timings.
+
+Experiment A changes only the generated JSON field
+`t1Parameter.chainingSize` from 4 to 8 or 16. Directly changing the ConfigGen
+`--chainingSize` argument is **not** equivalent: it also changes `vfuSlotCount`
+from 5 to 9/17 and expands `vfuLayout`, including adder instances. That initial
+build was cancelled and is not included in the results. The experiment
+instead preserves the complete four-slot configuration and edits one field.
+After restoring that field to 4, both generated JSON objects compare equal to
+the baseline. Ordinary group positions stay at four, the autonomous reduction
+position at one, execution pipes at five, and VME context banks at four.
+Tag widths and outstanding/completion bookkeeping scale with control capacity;
+no execution-resource or arbitration implementation is changed.
+
+| Control slots | Segmented matrix microkernel | GEMM regression | Llama layer | Layer change vs. 4 slots |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 30,360 | 83,610 | 1,027,059 | baseline |
+| 8 | 26,745 | 82,509 | 1,055,857 | +2.804% |
+| 16 | 26,745 | 82,811 | 1,055,642 | +2.783% |
+
+| Control slots | Layer mean occupied physical slots | Layer time with all slots occupied |
+| --- | ---: | ---: |
+| 4 | 3.2805 | 55.0855% |
+| 8 | 3.6177 | 3.1455% |
+| 16 | 3.6663 | 0.0759% |
+
+The microkernel benefits 11.9% from 4 to 8 slots, but gains nothing from 8 to
+16. The actual layer becomes about 2.8% slower, with virtually identical
+8/16-slot performance. More outstanding capacity therefore does not fix the
+layer regression. This does **not** prove or disprove wasted arbitration
+grants: group-window capacity and the selector were held constant. Physical
+lifetimes include waiting and retirement; they are not execution-unit latency.
+For example, layer `vtmmu` mean lifetime increases from 54.01 to 62.09 cycles
+when moving from four to eight slots despite the increased capacity.
+
+Another independent restriction to investigate is `LaneControl.scala`'s
+`flagBusy`: each Lane permits only one outstanding `updatesFflags` producer,
+including in threaded mode. Increasing control entries does not remove this
+restriction. Its contribution to total cycles has not been isolated by A.
+
+All nine A runs pass complete ISA/RTL memory comparison. Each workload uses
+the same ELF hash at all three capacities; observed peaks reach 4/8/16, with
+no unmatched releases, unreleased tags or unmatched issues. All three layer
+dumps are byte-identical, SHA-256
+`dd778954c451ae8b005c9ff2af6b6c0f7b6545efbb0bc9bd6e277df70f1db266`.
+The oracle uses the PR's updated unordered FP reduction tree. Its layer output
+differs slightly from the previous RTL's legal tree (maximum residual absolute
+difference `8.94e-8`, KV `9.54e-7`); do not require old/new full dumps to match.
+
+Build from the repository root with the prepared validation worktree:
+
+```bash
+nix build --impure --file nix/experiments/pr213-outstanding.nix \
+  --argstr rtlSource git+file:///root/t1-pr213-validation \
+  --arg slots 8 simulator -o /tmp/t1-pr213-control8-simulator \
+  --cores 4 --max-jobs 1
+```
+
+Use `slots = 4` or `16` for the other configurations. The four-slot derivation
+is identical to the original PR baseline, preserving its cache. The build
+does not rebuild Mojo. Simulation uses `profile-rtl.py` with the unchanged
+`/tmp/segmented-tu-stories-model/image.elf` and dump range
+`0x82000000:0x8474a740`. The corresponding oracle is
+`/tmp/pr213-stories-model/memdump.bin`.
+
+Artifacts are `/tmp/pr213-{micro,gemm,stories}-rtl` for four slots and
+`/tmp/pr213-control{8,16}-{micro,gemm,stories}-rtl` for A. Each contains the
+complete dump, MMIO markers and streamed profile; the A variants also contain
+`comparison.json`. Simulator store prefixes are `69qlwk4z303zc59w2rz6nqb69yb6lvqk`
+(4), `mnaj9h0nv40j3fg5a8bqypbhxgv95lhc` (8), and
+`0nrq29dxmbxw4ndrbjrbqjbjbcva9p98` (16), all suffixed
+`-t1-vme32t-threaded-t1rocketemu-verilated-simulator`.
+
 ### Confirmed scalar-to-vector correctness failure
 
 The four-hart synthetic single-token layer differs between the previously
