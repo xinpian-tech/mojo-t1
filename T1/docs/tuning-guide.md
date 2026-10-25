@@ -536,6 +536,63 @@ complete dump, MMIO markers and streamed profile; the A variants also contain
 `0nrq29dxmbxw4ndrbjrbqjbjbcva9p98` (16), all suffixed
 `-t1-vme32t-threaded-t1rocketemu-verilated-simulator`.
 
+### PR #215: wider group admission with correctness fixes
+
+PR #215 is pinned to `c809d80764a91727dc450b2cc3721775d616dc77`.
+The validation overlay is preserved in
+[`pr215-validation.patch`](../../nix/experiments/pr215-validation.patch).
+It carries the same Rocket scalar-FP/vector RAW and writeback arbitration
+fixes, SRT operation-selection fixes, memory readback and event gating as
+the PR #213 comparison. It also normalizes VLEN to 1024. This is not a test
+of the unmodified upstream PR configuration.
+
+Control entries remain four and execution pipes remain five. Public group
+positions increase from four to five, and ordinary group admission widens
+from one to five per Lane per cycle. This measures the combined PR change,
+not an isolated admission-width experiment. Software and workload ELF files
+are unchanged; only Stories15M layer 0 with four known tokens is measured.
+
+| Workload | Original corrected RTL | PR #213, four entries | PR #215, four entries |
+| --- | ---: | ---: | ---: |
+| Segmented `tu` matrix microkernel | 28,587 | 30,360 | 28,552 |
+| Quantized GEMM regression | 74,341 | 83,610 | 79,216 |
+| Stories15M layer 0 | 752,644 | 1,027,059 | 939,079 |
+
+All figures are kernel MMIO cycles. PR #215 reduces cycles versus PR #213
+by 5.96%, 5.26% and 8.57%, respectively. The Llama layer still takes 24.77%
+more cycles than the original corrected RTL. No frequency or physical-design
+benefit is included. The wider admission path helps, but does not recover
+the original layer performance; these measurements do not isolate the
+remaining resource-arbitration or floating-point serialization costs.
+
+All three simulations exit successfully and their complete memory dumps
+match their ISA references. The layer's 41,199,424-byte dump matches the
+PR #213 reduction-tree oracle, with SHA-256
+`dd778954c451ae8b005c9ff2af6b6c0f7b6545efbb0bc9bd6e277df70f1db266`.
+The layer uses VLEN=1024, DLEN=256, four harts and TE=32. Physical tag
+occupancy peaks at four, with no unmatched releases or unreleased tags.
+
+Apply the overlay to a clean checkout at the pinned revision, then build
+from the mojo-t1 repository root:
+
+```bash
+git -C /root/t1-pr215-validation apply \
+  "$PWD/nix/experiments/pr215-validation.patch"
+nix build --impure --file nix/experiments/pr213-outstanding.nix \
+  --argstr rtlSource git+file:///root/t1-pr215-validation \
+  --arg slots 4 simulator -o /tmp/t1-pr215-simulator \
+  --cores 4 --max-jobs 1
+```
+
+Only `slots=4` in that helper is compatible with PR #215: it passes through
+the configuration without editing the removed `chainingSize` field.
+The simulator store prefix is `x7wm9s2008asgp78kmz1nsj8fpy6c3f2`, suffixed
+`-t1-vme32t-threaded-t1rocketemu-verilated-simulator`. Mojo is not rebuilt.
+Run `profile-rtl.py` with the same ELF and dump range as the PR #213 test.
+Artifacts are `/tmp/pr215-{micro,gemm,stories}-rtl`, including MMIO markers,
+complete dumps, profiles and `comparison.json`; the layer's total simulation
+cycles are 939,392, distinct from its 939,079 kernel cycles.
+
 ### Confirmed scalar-to-vector correctness failure
 
 The four-hart synthetic single-token layer differs between the previously

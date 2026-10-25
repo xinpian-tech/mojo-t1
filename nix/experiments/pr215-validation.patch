@@ -1,0 +1,208 @@
+diff --git a/designs/vme32t-threaded.toml b/designs/vme32t-threaded.toml
+index 4b3eaeb6..93ff4ad3 100644
+--- a/designs/vme32t-threaded.toml
++++ b/designs/vme32t-threaded.toml
+@@ -1,8 +1,8 @@
+ [isa]
+ xlen = 32
+-vlen = 2048
+-march = "rv32imafc_zve32f_zvl2048b"
+-features = ["I", "M", "A", "C", "F", "zve32f", "zvl2048b"]
++vlen = 1024
++march = "rv32imafc_zve32f_zvl1024b"
++features = ["I", "M", "A", "C", "F", "zve32f", "zvl1024b"]
+ 
+ [uarch]
+ dlen = 256
+@@ -22,7 +22,7 @@ cmdopt = [
+   "--instructionSets=rv_f",
+   "--instructionSets=rv_v",
+   "--instructionSets=zve32f",
+-  "--instructionSets=zvl2048b",
++  "--instructionSets=zvl1024b",
+   "--cacheBlockBytes=32",
+   "--nPMPs=8",
+   "--cacheable=11111111111111111111111111111111",
+@@ -58,7 +58,7 @@ cmdopt = [
+   "--instructionSets=rv_f",
+   "--instructionSets=rv_v",
+   "--instructionSets=zve32f",
+-  "--instructionSets=zvl2048b",
++  "--instructionSets=zvl1024b",
+   "--cacheBlockBytes=32",
+   "--nPMPs=8",
+   "--cacheable=11111111111111111111111111111111",
+diff --git a/difftest/dpi_t1rocketemu/src/addrspace.rs b/difftest/dpi_t1rocketemu/src/addrspace.rs
+index 33d4828d..c1b4f6ab 100644
+--- a/difftest/dpi_t1rocketemu/src/addrspace.rs
++++ b/difftest/dpi_t1rocketemu/src/addrspace.rs
+@@ -64,6 +64,15 @@ impl WithUart for BusState {
+ }
+ 
+ impl AddressSpace {
++  pub fn dump_range(&mut self, addr: u32, len: u32, path: &Path) {
++    assert!(len > 0 && addr.checked_add(len).is_some(), "invalid memory dump range");
++    let device_idx = self.find_device_idx(addr, len).expect("memory dump outside device RAM");
++    let entry = &mut self.devices[device_idx];
++    let offset = (addr - entry.base_and_size.0) as usize;
++    let ram = entry.device.as_ram_mut().expect("memory dump requires a RAM device");
++    std::fs::write(path, &ram[offset..offset + len as usize]).expect("memory dump write failed");
++  }
++
+   pub fn req(&mut self, id: u64, addr: u32, len: u32, payload: MemReqPayload) -> bool {
+     if let MemReqPayload::Write(data, mask) = payload {
+       assert_eq!(len as usize, data.len());
+diff --git a/difftest/dpi_t1rocketemu/src/dpi.rs b/difftest/dpi_t1rocketemu/src/dpi.rs
+index 920f211a..31192370 100644
+--- a/difftest/dpi_t1rocketemu/src/dpi.rs
++++ b/difftest/dpi_t1rocketemu/src/dpi.rs
+@@ -311,12 +311,23 @@ unsafe extern "C" fn t1_cosim_final(target: *mut Target) {
+   }
+ 
+   let target = unsafe { Box::from_raw(target) };
+-  let Ok(driver) = target.into_inner() else {
++  let Ok(mut driver) = target.into_inner() else {
+     error!("'sim_result.json' generation skipped due to panic in DPI side");
+     return;
+   };
+ 
+   let success = driver.addr_space.exit_code() == Some(0);
++  if success {
++    let arguments = dpi_common::plusarg::PlusArgMatcher::from_args();
++    if let Some(path) = arguments.try_match("t1_memory_dump_path") {
++      let range = arguments.match_("t1_memory_dump_range");
++      let (start, end) = range.split_once(':').expect("memory dump range must be START:END");
++      let start = u32::from_str_radix(start.trim_start_matches("0x"), 16).expect("invalid dump start");
++      let end = u32::from_str_radix(end.trim_start_matches("0x"), 16).expect("invalid dump end");
++      assert!(end > start, "empty or reversed memory dump range");
++      driver.addr_space.dump_range(start, end - start, std::path::Path::new(path));
++    }
++  }
+   dpi_common::util::write_perf_json("t1rocketemu", crate::get_t(), success, &driver.meta);
+ }
+ 
+diff --git a/rocketvzaozi/src/Rocket.scala b/rocketvzaozi/src/Rocket.scala
+index e430f814..c695de61 100644
+--- a/rocketvzaozi/src/Rocket.scala
++++ b/rocketvzaozi/src/Rocket.scala
+@@ -1893,7 +1893,12 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+                   // fpHazardTargets (rocketv/src/RocketCore.scala:1311-1318): the FP
+                   // register ports the in-flight FP instruction reads/writes, keyed
+                   // by the float decode ren1/ren2/ren3/wen. Present iff usingFPU.
+-                  val fpHazardTargets: Option[Seq[(Referable[Bool], Referable[UInt])]] =
++                  val idUsesFpRegisters: Referable[Bool]                                 =
++                    if usingFPU then
++                      idDecodeOutput(d.fp) |
++                        (if usingVector then idDecodeOutput(d.vectorReadFRs1) else false.B)
++                    else false.B
++                  val fpHazardTargets:   Option[Seq[(Referable[Bool], Referable[UInt])]] =
+                     fpuDecOut.map(fdo =>
+                       Seq(
+                         (fdo(d.fren1), idRaddr1),
+@@ -1950,7 +1955,7 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+                       exRegDecodeOutput(d.wxd) & checkHazards(hazardTargets, _ === exWaddr)
+                     // fpDataHazardEx (rocketv/src/RocketCore.scala:1345-1349).
+                     val fpDataHazardEx: Option[Referable[Bool]] = fpHazardTargets.map(t =>
+-                      idDecodeOutput(d.fp) & exRegDecodeOutput(d.wfd) & checkHazards(
++                      idUsesFpRegisters & exRegDecodeOutput(d.wfd) & checkHazards(
+                         t,
+                         _ === exWaddr
+                       )
+@@ -1973,7 +1978,7 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+                       memRegDecodeOutput(d.wxd) & checkHazards(hazardTargets, _ === memWaddr)
+                     // fpDataHazardMem (rocketv/src/RocketCore.scala:1368-1372).
+                     val fpDataHazardMem: Option[Referable[Bool]] = fpHazardTargets.map(t =>
+-                      idDecodeOutput(d.fp) & memRegDecodeOutput(d.wfd) & checkHazards(
++                      idUsesFpRegisters & memRegDecodeOutput(d.wfd) & checkHazards(
+                         t,
+                         _ === memWaddr
+                       )
+@@ -1987,7 +1992,7 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+                     // fpDataHazardWb (rocketv/src/RocketCore.scala:1378-1385).
+                     val fpDataHazardWb: Referable[Bool] = fpHazardTargets
+                       .map(t =>
+-                        idDecodeOutput(d.fp) & wbRegDecodeOutput(d.wfd) & checkHazards(
++                        idUsesFpRegisters & wbRegDecodeOutput(d.wfd) & checkHazards(
+                           t,
+                           _ === wbWaddr
+                         )
+@@ -2058,11 +2063,7 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+                         io.traceStall |
+                         !clockEnable |
+                         // FP scoreboard stall (rocketv/src/RocketCore.scala:1437-1443).
+-                        (if usingFPU then
+-                           ((idDecodeOutput(d.fp) | idDecodeOutput(
+-                             d.vectorReadFRs1
+-                           )) & idStallFpu)
+-                         else false.B) |
++                        (idUsesFpRegisters & idStallFpu) |
+                         (idDecodeOutput(d.mem) & dcacheBlocked) |
+                         (if usingMulDiv then
+                            (idDecodeOutput(d.div) &
+@@ -2330,9 +2331,10 @@ object Rocket extends Generator[RocketParameter, RocketLayers, RocketInterface,
+                             t1XRDRetireQueue.deq.valid & t1XRDRetireQueue.deq.bits.isFp
+                           t1XRDRetireQueue.deq.ready :=
+                             (!(wbWxd | (dmemResponseReplay & dmemResponseXpu)) | !vectorTryToWriteRd) &
+-                              (!(dmemResponseReplay & dmemResponseFpu) | !vectorTryToWriteFP)
++                              (!(dmemResponseValid & dmemResponseFpu) | !vectorTryToWriteFP)
+ 
+                           when(t1XRDRetireQueue.deq.fire & vectorTryToWriteRd):
++                            mulDivRespReady     := false.B
+                             longlatencyWdata    := t1XRDRetireQueue.deq.bits.rdData.asUInt
+                             longlatencyWaddress := t1XRDRetireQueue.deq.bits.rdAddress
+                             longLatencyWenable  := true.B
+diff --git a/t1rocketemu/vsrc/T1RocketEmuTop.sv b/t1rocketemu/vsrc/T1RocketEmuTop.sv
+index 8044b0e7..5ca3f95b 100644
+--- a/t1rocketemu/vsrc/T1RocketEmuTop.sv
++++ b/t1rocketemu/vsrc/T1RocketEmuTop.sv
+@@ -192,6 +192,7 @@ module T1RocketEmuTop;
+   logic idle;
+ 
+   TestBench t1rocketemu(
++    .rtlEventEnable(__circt_lib_logging::log_fd != 0),
+     .clock,
+     .reset,
+     .resetVector,
+diff --git a/t1rocketzaozi/src/TestBench.scala b/t1rocketzaozi/src/TestBench.scala
+index 010bf14b..c9798e06 100644
+--- a/t1rocketzaozi/src/TestBench.scala
++++ b/t1rocketzaozi/src/TestBench.scala
+@@ -45,6 +45,7 @@ class TestBenchInterface(parameter: T1RocketTileParameter) extends HWBundle(para
+   val clock:       BundleField[Clock] = Flipped(Clock())
+   val reset:       BundleField[Reset] = Flipped(Reset())
+   val resetVector: BundleField[UInt]  = Flipped(UInt(32))
++  val rtlEventEnable: BundleField[Bool] = Flipped(Bool())
+   val idle:        BundleField[Bool]  = Aligned(Bool())
+ 
+ class TestBenchProbe(parameter: T1RocketTileParameter)
+@@ -327,7 +328,7 @@ object TestBench extends Generator[T1RocketTileParameter, TestBenchLayers, TestB
+     // one difftest event site: when(cond) { when(!reset) { fprintf } },
+     // mirroring the chisel printf's reset gating.
+     def event(cond: Referable[Bool], fmt: String, subs: Seq[Referable[?]]): Unit =
+-      when(cond) {
++      when(cond & io.rtlEventEnable) {
+         when(!io.reset.asBool) {
+           FPrintf.fprintf(io.clock, true.B, "rtl_event.jsonl", fmt, subs)
+         }
+diff --git a/t1zaozi/src/SRTFPWrapper.scala b/t1zaozi/src/SRTFPWrapper.scala
+index 72279187..a769e2f9 100644
+--- a/t1zaozi/src/SRTFPWrapper.scala
++++ b/t1zaozi/src/SRTFPWrapper.scala
+@@ -279,7 +279,7 @@ object SRTFPWrapper
+       (abs.io.bOut.asBits << leftShiftWidthDivisor).asUInt.asBits.bits(fpWidth - 1, 0).asUInt
+     )
+ 
+-    val muxSel = opSqrtReg | (io.input.bits.opSqrt & inputFire)
++    val muxSel = inputFire ? (io.input.bits.opSqrt, opSqrtReg)
+ 
+     val sqrtReady = sqrtIter.io.input.ready
+     val divReady  = divIter.io.input.ready
+@@ -333,7 +333,7 @@ object SRTFPWrapper
+     divIter.io.input.bits.partialSum   := partialSum
+     divIter.io.input.bits.partialCarry := partialCarry
+     divIter.io.input.bits.divider      := divDivisor
+-    divIter.io.input.bits.counter      := (opFloatReg | (io.input.bits.opFloat & inputFire)) ? (
++    divIter.io.input.bits.counter      := (inputFire ? (io.input.bits.opFloat, opFloatReg)) ? (
+       8.U(log2Ceil(fpWidth)),
+       toWidth(counter, log2Ceil(fpWidth))
+     )
